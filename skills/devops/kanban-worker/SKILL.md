@@ -278,3 +278,16 @@ Every tool has a CLI equivalent for human operators and scripts:
 - etc.
 
 Use the tools from inside an agent; the CLI exists for the human at the terminal.
+
+
+## DŁUGIE JOBY W TLE (>30 min) — NIE blokuj "do ręcznego odblokowania"
+
+Gdy odpalasz długi proces (scrape, build, migracja) którego nie dożyjesz w swojej sesji:
+
+1. Uruchom job w tle (nohup/setsid, log do pliku).
+2. Zarejestruj wait dla job_waitera — dopisz linię do `/home/tomek/.hermes/job_waits.txt`:
+   `<board>|<task_id>|<host>|<pid1,pid2>` (host = `local` dla debiantest, albo IP np. `192.168.1.35`).
+3. `kanban_block` z krótkim powodem: co działa, gdzie logi, co zostało do dokończenia po wznowieniu.
+4. Cron job_waiter (*/10) sam odblokuje task gdy PID-y umrą — dispatcher respawnuje workera, który dokończy wg Twojego komentarza.
+
+NIGDY nie pisz w powodzie blocka "odblokuj gdy skończą" / "czekam na review" — nikt tego ręcznie nie zrobi, praca stoi. Review-required jest ZAKAZANE (żelazna zasada auto-merge); jedyne 4 wyjątki: realne dane pacjentów AsiaCRM, destrukcyjne migracje DB, rotacja secrets, finanse.
