@@ -3943,6 +3943,37 @@ def run_conversation(
                 ):
                     messages.pop()
 
+                # KANBAN PROTOCOL GUARD (local patch 2026-06-11): worker
+                # dispatcherski (HERMES_KANBAN_TASK) nie moze zakonczyc
+                # rozmowy bez kanban_complete/kanban_block — wstrzykujemy
+                # JEDEN przypominajacy turn; jesli model dalej odmawia,
+                # wychodzimy normalnie (dispatcher policzy violation).
+                _kb_tid = os.environ.get("HERMES_KANBAN_TASK")
+                if (
+                    _kb_tid
+                    and not os.environ.get("HERMES_KANBAN_FINALIZED")
+                    and not getattr(agent, "_kanban_guard_injected", False)
+                ):
+                    agent._kanban_guard_injected = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "PROTOCOL GUARD (automat): jestes kanban-workerem "
+                            f"taska {_kb_tid}, a rozmowa konczy sie bez "
+                            "finalizacji. NAJPIERW upewnij sie, ze zmiany sa "
+                            "git commit + push (inaczej przepadna przy "
+                            "deployu), POTEM wywolaj kanban_complete (sukces) "
+                            "albo kanban_block z powodem. Wyjscie bez tego = "
+                            "protocol_violation i respawn taska od zera."
+                        ),
+                    })
+                    logger.warning(
+                        "kanban protocol guard: injected finalize reminder for %s",
+                        _kb_tid,
+                    )
+                    continue
+
                 messages.append(final_msg)
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"

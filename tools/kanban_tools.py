@@ -554,6 +554,9 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            # local patch 2026-06-11: sygnal dla protocol-guarda w
+            # conversation_loop, ze worker sfinalizowal swoj task.
+            os.environ["HERMES_KANBAN_FINALIZED"] = "1"
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -592,6 +595,9 @@ def _handle_block(args: dict, **kw) -> str:
                     f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
+            # local patch 2026-06-11: sygnal dla protocol-guarda w
+            # conversation_loop, ze worker sfinalizowal swoj task.
+            os.environ["HERMES_KANBAN_FINALIZED"] = "1"
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
