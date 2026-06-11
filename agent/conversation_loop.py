@@ -668,6 +668,34 @@ def run_conversation(
         if agent._budget_grace_call:
             agent._budget_grace_call = False
         elif not agent.iteration_budget.consume():
+            # KANBAN FINALIZE GRACE (local patch 2026-06-11): worker z
+            # wyczerpanym budzetem, ale niesfinalizowanym taskiem dostaje
+            # max 2 dodatkowe wywolania WYLACZNIE na kanban_complete/block
+            # (case t_6837532e: 60/60 wyczerpane miedzy push+PR a complete).
+            _kb_tid = os.environ.get("HERMES_KANBAN_TASK")
+            _graces = getattr(agent, "_kanban_finalize_graces", 0)
+            if (
+                _kb_tid
+                and not os.environ.get("HERMES_KANBAN_FINALIZED")
+                and _graces < 2
+            ):
+                agent._kanban_finalize_graces = _graces + 1
+                agent._budget_grace_call = True
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "PROTOCOL GUARD (automat): budzet iteracji wyczerpany, "
+                        f"a task {_kb_tid} nie jest sfinalizowany. NIE wykonuj "
+                        "dalszej pracy. Jesli zmiany sa zacommitowane i "
+                        "wypchniete na origin — wywolaj kanban_complete; w "
+                        "przeciwnym razie kanban_block z opisem co zrobione, a "
+                        "co zostalo. Masz maksymalnie 2 dodatkowe wywolania."
+                    ),
+                })
+                logger.warning(
+                    "kanban finalize grace #%d for %s", _graces + 1, _kb_tid
+                )
+                continue
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
