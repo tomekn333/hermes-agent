@@ -2126,6 +2126,10 @@
         h(Button, {
           onClick: function () {
             if (!assignee) return;
+            if (!props.count || props.count === 0) {
+              window.alert("Najpierw zaznacz zadania klikajac w karty (klik = wybierz, Ctrl/Shift+klik = wybierz wiele). Apply dziala tylko na zaznaczonych.");
+              return;
+            }
             props.onApply({ assignee: assignee === "__none__" ? "" : assignee, reclaim_first: reclaimFirst });
             setAssignee("");
           },

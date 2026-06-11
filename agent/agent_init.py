@@ -255,6 +255,10 @@ def init_agent(
 
     agent.model = model
     agent.max_iterations = max_iterations
+    # Hard guard: abort the session when this many consecutive tool errors occur.
+    # Read from env so gateway/run.py can bridge from config.yaml.
+    agent.max_consecutive_errors = int(os.getenv("HERMES_MAX_CONSECUTIVE_ERRORS", "5"))
+    agent.max_tool_errors_total = int(os.getenv("HERMES_MAX_TOOL_ERRORS_TOTAL", "15"))
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)

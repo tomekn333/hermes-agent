@@ -2569,10 +2569,123 @@ class SlackAdapter(BasePlatformAdapter):
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count, session_key, choice, user_name,
             )
+            
+            # ====== Persistent Approval Recovery (t_883c5e0d) ======
+            # When resolve_gateway_approval returns 0, the approval was not pending
+            # (orphaned by a gateway restart). Check ~/.hermes/pending_approvals.json
+            # for an orphaned entry matching this session_key. If found, approve the
+            # pattern and re-dispatch the session so it resumes with the pre-approved
+            # pattern, allowing the user's original command to proceed.
+            if count == 0:
+                orphaned_entry = await self._check_and_recover_orphaned_approval(
+                    session_key=session_key, choice=choice, user_name=user_name
+                )
+                if orphaned_entry:
+                    logger.info(
+                        "[Slack] Recovered orphaned approval for session %s; "
+                        "pre-approved %d pattern(s) and triggered resume_pending",
+                        session_key, len(orphaned_entry.get("pattern_keys", []))
+                    )
+            # ============================================================
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
 
         # (approval state already consumed by atomic pop above)
+
+    async def _check_and_recover_orphaned_approval(
+        self, session_key: str, choice: str, user_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Check for and recover an orphaned pending approval entry.
+        
+        When resolve_gateway_approval returns 0, the session's approval was likely
+        orphaned by a gateway restart. This method:
+        1. Reads ~/.hermes/pending_approvals.json
+        2. Finds an entry matching session_key (orphaned or recent)
+        3. If found, pre-approves its pattern_keys and marks the session for resume
+        4. Returns the entry if recovered, None otherwise
+        
+        Returns the orphaned entry dict if recovered, None otherwise.
+        """
+        try:
+            pending_path = os.path.expanduser("~/.hermes/pending_approvals.json")
+            if not os.path.exists(pending_path):
+                return None
+            
+            import json as _json
+            try:
+                with open(pending_path, "r") as f:
+                    pending_data = _json.load(f)
+            except Exception as e:
+                logger.debug("[Slack] Failed to read pending_approvals.json: %s", e)
+                return None
+            
+            if not isinstance(pending_data, dict) or session_key not in pending_data:
+                return None
+            
+            orphaned_entry = pending_data[session_key]
+            pattern_keys = orphaned_entry.get("pattern_keys", [])
+            
+            # Pre-approve each pattern for this session
+            try:
+                from tools.approval import approve_session
+                for pattern_key in pattern_keys:
+                    if pattern_key:
+                        approve_session(session_key, pattern_key)
+                logger.debug(
+                    "[Slack] Pre-approved %d pattern(s) for orphaned session %s",
+                    len(pattern_keys), session_key
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Slack] Failed to pre-approve patterns for orphaned session %s: %s",
+                    session_key, e
+                )
+            
+            # Mark the session for resume (this will trigger replay of the last user turn)
+            try:
+                session_store = getattr(self, "_session_store", None)
+                if session_store and hasattr(session_store, "mark_resume_pending"):
+                    marked = session_store.mark_resume_pending(
+                        session_key, "orphaned_approval_recovered"
+                    )
+                    logger.debug(
+                        "[Slack] Session %s marked for resume_pending: %s",
+                        session_key, marked
+                    )
+                else:
+                    logger.warning(
+                        "[Slack] session_store not available to mark_resume_pending for %s",
+                        session_key
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[Slack] Failed to mark session %s for resume: %s", session_key, e
+                )
+            
+            # Clean up the orphaned entry from the file
+            try:
+                pending_data.pop(session_key, None)
+                tmp_path = pending_path + ".tmp"
+                with open(tmp_path, "w") as f:
+                    _json.dump(pending_data, f, ensure_ascii=False)
+                os.replace(tmp_path, pending_path)
+                logger.info(
+                    "[Slack] Cleaned up orphaned approval entry for session %s",
+                    session_key
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Slack] Failed to clean up orphaned entry for session %s: %s",
+                    session_key, e
+                )
+            
+            return orphaned_entry
+        
+        except Exception as e:
+            logger.error(
+                "[Slack] Unexpected error in _check_and_recover_orphaned_approval: %s", e
+            )
+            return None
 
     # ----- Thread context fetching -----
 

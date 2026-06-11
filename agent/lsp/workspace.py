@@ -190,7 +190,17 @@ def resolve_workspace_for_file(
 
     Returns ``(None, False)`` when neither path is in a git worktree.
     """
-    cwd = cwd or os.getcwd()
+    if not cwd:
+        try:
+            cwd = os.getcwd()
+        except (FileNotFoundError, OSError):
+            # Proces stracil cwd (katalog usuniety pod nim) — odzyskaj
+            # bezpieczny katalog i napraw cwd procesu dla kolejnych wywolan.
+            cwd = os.path.expanduser("~")
+            try:
+                os.chdir(cwd)
+            except OSError:
+                pass
     cwd_root = find_git_worktree(cwd)
     if cwd_root is not None:
         if is_inside_workspace(file_path, cwd_root):

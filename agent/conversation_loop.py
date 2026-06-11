@@ -331,6 +331,11 @@ def run_conversation(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    # Hard guard counter: consecutive tool errors in this turn.
+    # Reset on first successful tool; triggers session abort when >= max_consecutive_errors.
+    agent._tool_error_streak = 0
+    # Hard guard 2 (2026-06-01 Cowork): TOTAL tool errors w sesji (NIE reset na success).
+    agent._tool_error_total = 0
     # True until the server rejects an image_url content part with an error
     # like "Only 'text' content type is supported."  Set to False on first
     # rejection and kept False for the rest of the session so we never re-send
@@ -2326,6 +2331,13 @@ def run_conversation(
                     agent._client_log_context(),
                     _error_summary,
                 )
+                if isinstance(api_error, (TypeError, AttributeError)) and "is not iterable" in str(api_error):
+                    import traceback as _tb
+                    logger.error(
+                        "%sPARSE-TRACEBACK (%s):\n%s",
+                        agent.log_prefix, error_type,
+                        "".join(_tb.format_exception(type(api_error), api_error, api_error.__traceback__)),
+                    )
 
                 _provider = getattr(agent, "provider", "unknown")
                 _base = getattr(agent, "base_url", "unknown")
@@ -2805,6 +2817,16 @@ def run_conversation(
                     # ssl.SSLError explicitly so the error classifier's
                     # retryable=True mapping takes effect instead.
                     and not isinstance(api_error, ssl.SSLError)
+                    # Codex (Responses API) intermittently yields a malformed/
+                    # empty response whose post-stream processing raises
+                    # TypeError 'NoneType object is not iterable' -- a transient
+                    # provider-response failure, NOT a local programming bug.
+                    # Treat as retryable so Codex retries instead of aborting
+                    # (no fallback cascade). 2026-05-27.
+                    and not (
+                        isinstance(api_error, TypeError)
+                        and "is not iterable" in str(api_error)
+                    )
                 )
                 # ``FailoverReason.billing`` (HTTP 402) is NOT in this
                 # exclusion set.  By the time we reach this block:
@@ -3475,6 +3497,36 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                # Hard guard 2 (2026-06-01): TOTAL tool errors (sumuje).
+                _max_total_guard = getattr(agent, "max_tool_errors_total", 15)
+                _total_guard = getattr(agent, "_tool_error_total", 0)
+                if _total_guard >= _max_total_guard:
+                    _abort_msg = f"Sesja przerwana: {_total_guard} bledow narzedzia w sumie. Zglos uzytkownikowi."
+                    _turn_exit_reason = f"total_tool_errors({_total_guard})"
+                    try: agent._emit_status(f"Hard guard 2: {_total_guard} bledow lacznie")
+                    except Exception: pass
+                    final_response = _abort_msg
+                    messages.append({"role": "assistant", "content": final_response})
+                    break
+
+                # Hard guard: abort session if too many consecutive tool errors.
+                _max_consec = getattr(agent, "max_consecutive_errors", 5)
+                _streak = getattr(agent, "_tool_error_streak", 0)
+                if _streak >= _max_consec:
+                    _abort_msg = (
+                        f"Sesja przerwana: {_streak} kolejnych bledow narzedzia. "
+                        "Zglos uzytkownikowi co konkretnie sie nie udalo i popros o wytyczne."
+                    )
+                    _turn_exit_reason = f"consecutive_tool_errors({_streak})"
+                    agent._emit_status(f"\u26a0\ufe0f Hard guard: {_streak} kolejnych bledow toola — przerywam sesje")
+                    try:
+                        agent._safe_print(f"\n\u26a0\ufe0f  {_abort_msg}\n")
+                    except Exception:
+                        pass
+                    final_response = _abort_msg
+                    messages.append({"role": "assistant", "content": final_response})
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

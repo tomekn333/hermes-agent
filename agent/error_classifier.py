@@ -511,6 +511,17 @@ def classify_api_error(
             should_compress=True,
         )
 
+    # Anthropic Max rolling-allowance exhaustion (400 "out of extra usage") -> transient rate_limit.
+    if (
+        "out of extra usage" in error_msg
+        or ("extra usage" in error_msg and "claude.ai/settings/usage" in error_msg)
+    ):
+        return _result(
+            FailoverReason.rate_limit,
+            retryable=True,
+            should_compress=False,
+        )
+
     # Anthropic OAuth subscription rejects the 1M-context beta header.
     # Observed error body: "The long context beta is not yet available for
     # this subscription." Returned as HTTP 400 from native Anthropic when

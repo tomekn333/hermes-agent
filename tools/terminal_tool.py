@@ -1018,7 +1018,17 @@ def _get_env_config() -> Dict[str, Any]:
     # remote home, Vercel uses its documented workspace root, and everything
     # else starts in the backend's default root-like cwd.
     if env_type == "local":
-        default_cwd = os.getcwd()
+        try:
+            default_cwd = os.getcwd()
+        except (FileNotFoundError, OSError):
+            # Proces stracil cwd (np. katalog usuniety/odtworzony pod nim).
+            # Napraw cwd procesu, zeby kolejne os.getcwd() w innych narzedziach
+            # tez przestaly sie wywalac.
+            recovered = os.environ.get("TERMINAL_CWD") or os.path.expanduser("~")
+            if not os.path.isdir(recovered):
+                recovered = os.path.expanduser("~")
+            os.chdir(recovered)
+            default_cwd = recovered
     elif env_type == "ssh":
         default_cwd = "~"
     elif env_type == "vercel_sandbox":

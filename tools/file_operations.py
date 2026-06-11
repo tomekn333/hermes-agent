@@ -1477,7 +1477,13 @@ class ShellFileOperations(FileOperations):
             svc = get_service()
         except Exception:  # noqa: BLE001
             return ""
-        if svc is None or not svc.enabled_for(path):
+        try:
+            if svc is None or not svc.enabled_for(path):
+                return ""
+        except Exception:  # noqa: BLE001
+            # enabled_for moze rzucic FileNotFoundError gdy proces stracil
+            # CWD (os.getcwd() w resolve_workspace_for_file) — diagnostyka
+            # LSP jest best-effort i nigdy nie moze wywalic zapisu pliku.
             return ""
 
         # Build a line-shift map when we have both pre and post — it

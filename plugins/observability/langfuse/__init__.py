@@ -211,6 +211,11 @@ def _get_langfuse() -> Optional[Langfuse]:
 
     try:
         _LANGFUSE_CLIENT = Langfuse(**kwargs)
+        try:
+            import atexit as _atexit
+            _atexit.register(_LANGFUSE_CLIENT.shutdown)  # clean flush+stop on exit (avoids otel use_span GeneratorExit noise at teardown)
+        except Exception:
+            pass
     except Exception as exc:  # pragma: no cover - fail-open
         logger.warning("Could not initialize Langfuse client: %s", exc)
         _LANGFUSE_CLIENT = _INIT_FAILED
@@ -552,6 +557,19 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "api_mode": api_mode,
     }
 
+    # Dynamiczne tagi per-app: platforma + surface (kanban vs chat) + task_id.
+    _dyn_tags = ["hermes", "langfuse"]
+    if platform:
+        _dyn_tags.append(f"platform:{platform}")
+    if task_id:
+        _dyn_tags += ["surface:kanban", f"task:{task_id}"]
+        _trace_name = f"kanban:{task_id}"
+        metadata["surface"] = "kanban"
+    else:
+        _dyn_tags.append("surface:chat")
+        _trace_name = f"chat:{platform}" if platform else "Hermes turn"
+        metadata["surface"] = "chat"
+
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
     if session_id:
@@ -561,12 +579,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         try:
             with propagate_attributes(
                 session_id=session_id or task_key,
-                trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
+                trace_name=_trace_name,
+                tags=_dyn_tags,
             ):
                 root_ctx = client.start_as_current_observation(
                     trace_context=trace_ctx,
-                    name="Hermes turn",
+                    name=_trace_name,
                     as_type="chain",
                     input=trace_input,
                     metadata=metadata,
@@ -576,7 +594,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         except Exception:
             root_ctx = client.start_as_current_observation(
                 trace_context=trace_ctx,
-                name="Hermes turn",
+                name=_trace_name,
                 as_type="chain",
                 input=trace_input,
                 metadata=metadata,
@@ -586,7 +604,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     else:
         root_ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
-            name="Hermes turn",
+            name=_trace_name,
             as_type="chain",
             input=trace_input,
             metadata=metadata,

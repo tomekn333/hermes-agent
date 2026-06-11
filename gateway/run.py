@@ -910,6 +910,8 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
+            if "max_consecutive_errors" in _agent_cfg:
+                os.environ["HERMES_MAX_CONSECUTIVE_ERRORS"] = str(_agent_cfg["max_consecutive_errors"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
@@ -3695,6 +3697,67 @@ class GatewayRunner:
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
 
+    def _recover_orphaned_approvals(self) -> int:
+        """Re-arm sessions whose gateway approval was orphaned by a restart.
+
+        The approval-guard plugin persists pending approvals to
+        ~/.hermes/pending_approvals.json regardless of how the process exits.
+        On startup we mark those (fresh) sessions resume_pending
+        ("restart_interrupted") and pre-approve their command pattern(s) so the
+        existing resume machinery re-runs the interrupted turn. Never raises.
+        """
+        import json as _json
+        import os as _os
+        import time as _time
+        path = _os.path.expanduser("~/.hermes/pending_approvals.json")
+        try:
+            with open(path) as _f:
+                data = _json.load(_f)
+        except Exception:
+            return 0
+        if not isinstance(data, dict) or not data:
+            return 0
+        try:
+            from tools.approval import approve_session
+        except Exception:
+            approve_session = None
+        window = _auto_continue_freshness_window()
+        now = _time.time()
+        recovered = 0
+        keep: dict = {}
+        for sk, info in data.items():
+            try:
+                created = float(info.get("created_at", 0) or 0)
+            except Exception:
+                created = 0.0
+            if window > 0 and created and (now - created) > window:
+                continue
+            marked = False
+            try:
+                marked = self.session_store.mark_resume_pending(sk, "restart_interrupted")
+            except Exception as exc:
+                logger.debug("recover-approval: mark_resume_pending failed for %s: %s", sk, exc)
+            if marked:
+                if approve_session is not None:
+                    for pk in (info.get("pattern_keys") or []):
+                        try:
+                            approve_session(sk, pk)
+                        except Exception:
+                            pass
+                recovered += 1
+            else:
+                keep[sk] = info
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as _f:
+                _json.dump(keep, _f, ensure_ascii=False)
+            _os.replace(tmp, path)
+        except Exception as exc:
+            logger.debug("recover-approval: rewrite state failed: %s", exc)
+        if recovered:
+            logger.info("Re-armed %d orphaned approval session(s) for auto-resume", recovered)
+        return recovered
+
     def _schedule_resume_pending_sessions(self) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -4256,6 +4319,10 @@ class GatewayRunner:
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
         # by the normal successful-turn path, so a failed auto-resume remains
         # visible for manual recovery on the next user message.
+        try:
+            self._recover_orphaned_approvals()
+        except Exception as _e:
+            logger.warning("recover-approval: startup recovery failed: %s", _e)
         self._schedule_resume_pending_sessions()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)

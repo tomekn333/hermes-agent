@@ -13,6 +13,40 @@ metadata:
 
 > You're seeing this skill because the Hermes Kanban dispatcher spawned you as a worker with `--skills kanban-worker` — it's loaded automatically for every dispatched worker. The **lifecycle** (6 steps: orient → work → heartbeat → block/complete) also lives in the `KANBAN_GUIDANCE` block that's auto-injected into your system prompt. This skill is the deeper detail: good handoff shapes, retry diagnostics, edge cases.
 
+## ⚠️ KRYTYCZNE: NIE usuwaj swojego CWD
+
+**Pattern który już 6x dzisiaj zatrzymał workery** (2026-06-09):
+
+Worker w trakcie "stale-worktree cleanup" robi `rm -rf $WORKTREE` w katalogu w którym sam siedzi (z którego ma CWD). Po tym:
+- `os.getcwd()` zwraca `FileNotFoundError: [Errno 2] No such file or directory`
+- **WSZYSTKIE tools (terminal, execute_code, git) failują** — bo Python próbuje resolve CWD przed każdym subprocess
+
+**ZAWSZE PRZED `rm -rf` lub `git worktree remove`:**
+
+```bash
+# 1) Zapisz aktualny path
+ORIG_CWD=$(pwd)
+# 2) Chdir na BEZPIECZNE miejsce (poza tym co kasujesz)
+cd /tmp || cd /
+# 3) Dopiero teraz usuwaj
+rm -rf "$WORKTREE"  # lub git worktree remove
+# 4) Jeśli odtwarzasz worktree, chdir do nowego
+cd "$NEW_WORKTREE"
+```
+
+**Lub w Python:**
+```python
+import os
+os.chdir('/tmp')  # PRZED kasowaniem
+shutil.rmtree(workdir)
+os.makedirs(workdir)
+os.chdir(workdir)  # po odtworzeniu
+```
+
+**Sygnał alarmowy:** jeśli zobaczysz "The cwd got removed" lub "FileNotFoundError: os.getcwd()" w log workera — to TY zrobiłeś rm -rf na CWD. Recovery: gateway musi być zrestartowany przez Tomka (nie da się fix from within worker).
+
+---
+
 ## Workspace handling
 
 Your workspace kind determines how you should behave inside `$HERMES_KANBAN_WORKSPACE`:
@@ -47,20 +81,75 @@ kanban_complete(
 )
 ```
 
-**Coding task that needs human review (review-required):**
+**Coding task → AUTO-MERGE (ŻELAZNA ZASADA od 2026-06-08):**
 
-For most code-changing tasks, the work isn't truly *done* until a human reviewer has eyes on it. Block instead of complete, with `reason` prefixed `review-required: ` so the dashboard surfaces the row as needing review. Drop the structured metadata (changed files, test counts, diff/PR url) into a comment first, since `kanban_block` only carries the human-readable reason — comments are the durable annotation channel. Reviewer either approves and runs `hermes kanban unblock <id>` (which re-spawns you with the comment thread for any follow-ups) or asks for changes via another comment.
+⚠️ **NIE używaj `kanban_block(reason="review-required: ...")` jako default end-state.** Tomek wycofał fazę review dla wszystkich projektów (asiacrm wyjątek tylko dla danych pacjentów real prod, nie test).
+
+**Standardowy flow dla każdego coding-taska zakończonego sukcesem:**
+
+```bash
+# 1) Commit + push branch
+git push origin "$BRANCH"
+
+# 2) PR (jeśli jeszcze nie ma)
+gh pr create --base main --head "$BRANCH" \
+  --title "<short title>" --body "<body z metadanymi>"
+
+# 3) AUTO-MERGE od razu (nie czekamy na CI ani na człowieka)
+gh pr merge --squash --delete-branch
+
+# 4) Auto-deploy uruchamia się sam (webhook na origin/main)
+```
+
+Następnie:
+
+```python
+kanban_complete(
+    result=json.dumps({
+        "pr_url": "https://github.com/tomekn333/<repo>/pull/<N>",
+        "merge_commit": "<sha>",
+        "branch_deleted": True,
+        "changed_files": ["..."],
+        "tests_run": 14,
+        "tests_passed": 14,
+        "deploy_triggered": True,  # webhook auto-deploy
+    }),
+)
+```
+
+Powiadom kanał Slack projektu jednoznacznie:
+> ✅ Zrobione + zmergowane + deploy w toku. PR: <link>. Jeśli coś nie tak — mów "rollback".
+
+**WYJĄTKI** (tylko te 4 — wtedy `kanban_block` z konkretnym reason):
+1. Migracje DB destrukcyjne (DROP, DELETE bez WHERE, ALTER TABLE w prod)
+2. AsiaCRM zmiany dotykające danych pacjentów REAL (nie test data) — patrz [[asiacrm-patient-data]]
+3. Zmiany w integracjach wymagających rotacji secrets/credentials
+4. Zmiany w produkcyjnych systemach finansowych
+
+Reason w tych przypadkach: `needs-human-decision: <konkretna decyzja do podjęcia>`. NIE `review-required`.
+
+**Rollback procedure** (gdy Tomek mówi "rollback"):
+```bash
+gh pr list --base main --merged --limit 5  # znaleźć ostatni merge
+git revert -m 1 <merge-commit>
+git push origin main
+# Auto-deploy z rewertem
+```
+
+---
+
+**[ARCHIWALNY przykład review handoffu, ZACHOWANY tylko dla wyjątków z listy 1-4 powyżej]:**
 
 ```python
 import json
 
 kanban_comment(
-    body="review-required handoff:\n" + json.dumps({
+    body="needs-human-decision handoff:\n" + json.dumps({
         "changed_files": ["rate_limiter.py", "tests/test_rate_limiter.py"],
         "tests_run": 14,
         "tests_passed": 14,
-        "diff_path": "/path/to/worktree",  # or PR url if pushed
-        "decisions": ["user_id primary, IP fallback for unauthenticated requests"],
+        "diff_path": "/path/to/worktree",
+        "decisions_pending": ["user_id primary vs IP fallback — wpływ na compliance"],
     }, indent=2),
 )
 kanban_block(

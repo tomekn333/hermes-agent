@@ -465,6 +465,59 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+
+    # ---- HARD GATE: block completion while work is uncommitted or unpushed.
+    # Runs in the worker's own process so cwd is the repo/worktree the worker
+    # actually edited. Catches both failure modes that silently lose work on
+    # auto-deploy: (a) live --reload edits never committed, (b) commits never
+    # pushed to origin. Fail-open on any error / non-repo task so it can never
+    # brick a legitimate completion. Escape hatch: HERMES_SKIP_PUSH_GATE=1.
+    def _push_gate():
+        import os as _os, subprocess as _sp
+        if _os.environ.get("HERMES_SKIP_PUSH_GATE") == "1":
+            return None
+        def _g(*a):
+            return _sp.run(["git", *a], cwd=_os.getcwd(),
+                           capture_output=True, text=True, timeout=20)
+        try:
+            r = _g("rev-parse", "--is-inside-work-tree")
+            if r.returncode != 0 or r.stdout.strip() != "true":
+                return None
+            top = _g("rev-parse", "--show-toplevel").stdout.strip()
+            st = _g("status", "--porcelain", "--untracked-files=no")
+            if st.returncode == 0 and st.stdout.strip():
+                return ("uncommitted", top, st.stdout.strip()[:400])
+            head = _g("rev-parse", "HEAD").stdout.strip()
+            cont = _g("branch", "-r", "--contains", head)
+            if not any(ln.strip().startswith("origin/")
+                       for ln in cont.stdout.splitlines()):
+                br = _g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+                return ("unpushed", top, br)
+            return None
+        except Exception:
+            return None
+    _gate = _push_gate()
+    if _gate:
+        _kind, _top, _detail = _gate
+        if _kind == "uncommitted":
+            return tool_error(
+                "kanban_complete blocked: uncommitted changes in the repo at "
+                + _top + " (" + _detail + "). Auto-deploy overwrites uncommitted "
+                "live edits, so this is NOT done. Commit AND push your work "
+                "(worktree: git push -u origin <branch> + open a PR; main repo: "
+                "git push origin <branch>), then retry kanban_complete. The task "
+                "is still in-flight (no state change). If this task legitimately "
+                "changes no tracked files, set HERMES_SKIP_PUSH_GATE=1 and retry."
+            )
+        return tool_error(
+            "kanban_complete blocked: branch '" + _detail + "' at " + _top
+            + " has commits not on origin (unpushed). Auto-deploy only sees "
+            "origin, so this work would be lost on the next deploy. Run "
+            "git push -u origin " + _detail + " and open a PR, then retry "
+            "kanban_complete. The task is still in-flight (no state change). "
+            "For a legit no-push task set HERMES_SKIP_PUSH_GATE=1 and retry."
+        )
+
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

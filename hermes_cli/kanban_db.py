@@ -1473,15 +1473,26 @@ def write_txn(conn: sqlite3.Connection):
     Use for any multi-statement write (creating a task + link, claiming a
     task + recording an event, etc.).  A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
+
+    SQLite can auto-abort a transaction before control returns here
+    (e.g. certain operational errors on COMMIT/UPDATE paths). In that case a
+    second raw ``ROLLBACK`` raises ``cannot rollback - no transaction is
+    active`` and masks the original failure. Guard the rollback so callers see
+    the real exception and long-running loops (like the gateway kanban
+    notifier) keep their useful error signal.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
-        conn.execute("ROLLBACK")
+        if getattr(conn, "in_transaction", False):
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
         raise
     else:
-        conn.execute("COMMIT")
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
