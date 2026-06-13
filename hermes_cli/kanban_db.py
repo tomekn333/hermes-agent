@@ -5793,6 +5793,13 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    # CC-WORKER OVERRIDE: profil "claude-code" -> headless Claude Code (pula Max
+    # OAuth, NIE extra usage). env HERMES_KANBAN_* jest juz ustawione powyzej i
+    # przekazane do Popen; wrapper czyta task z DB i finalizuje przez `hermes
+    # kanban complete/block`. Nadpisujemy gotowe cmd, zeby nie ruszac parsowania
+    # standardowej sciezki workerow (zero ryzyka regresji dla innych profili).
+    if profile_arg == "claude-code":
+        cmd = ["/home/tomek/scripts/hermes_cc_worker.sh"]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
