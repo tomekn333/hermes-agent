@@ -5798,8 +5798,44 @@ def _default_spawn(
     # przekazane do Popen; wrapper czyta task z DB i finalizuje przez `hermes
     # kanban complete/block`. Nadpisujemy gotowe cmd, zeby nie ruszac parsowania
     # standardowej sciezki workerow (zero ryzyka regresji dla innych profili).
-    if profile_arg == "claude-code":
-        cmd = ["/home/tomek/scripts/hermes_cc_worker.sh"]
+    # CC-ROUTER: dla zadań kodujących wybierz silnik dynamicznie wg łańcucha
+    # Codex -> Claude Code (Max) -> DeepSeek(future) -> Claude API (ostatnie).
+    # Logika wspólna z tier-gate (engine_avail.pick_engine). env HERMES_KANBAN_*
+    # jest już ustawione; dla codex/api przełączamy profil na coder.
+    if profile_arg in ("claude-code", "coder", "codex", "default"):
+        import sys as _sys
+        if "/home/tomek/.hermes" not in _sys.path:
+            _sys.path.insert(0, "/home/tomek/.hermes")
+        try:
+            import engine_avail as _ea
+            _eng = _ea.pick_engine()
+        except Exception:
+            _eng = None
+        if _eng == "claude-code":
+            cmd = ["/home/tomek/scripts/hermes_cc_worker.sh"]
+        elif _eng in ("codex", "claude-api"):
+            from hermes_cli.profiles import normalize_profile_name as _np, resolve_profile_env as _rpe
+            _cp = _np("coder")
+            try:
+                env["HERMES_HOME"] = _rpe(_cp)
+            except Exception:
+                pass
+            env["HERMES_PROFILE"] = _cp
+            _c = [*_resolve_hermes_argv(), "-p", _cp, "--accept-hooks"]
+            if _kanban_worker_skill_available(env.get("HERMES_HOME")):
+                _c.extend(["--skills", "kanban-worker"])
+            if task.skills:
+                for sk in task.skills:
+                    if sk and sk != "kanban-worker":
+                        _c.extend(["--skills", sk])
+            if _eng == "claude-api":
+                # wymuś provider anthropic (API) = ostatni szczebel; bez tego coder=codex
+                _c.extend(["-m", "claude-sonnet-4-6"])
+            _c.extend(["chat", "-q", prompt])
+            cmd = _c
+        else:
+            # None (wszystko wyczerpane) — nie spawnuj na ślepo; spawn-failure -> block
+            raise RuntimeError("cc-router: brak dostępnego silnika (Codex/Claude Code/API wyczerpane)")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
