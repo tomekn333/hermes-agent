@@ -28,6 +28,9 @@ Twoim zadaniem jest **wymuszenie pełnego formatu** — nie pozwalaj sobie ani T
 
 ## Proces — 5 kroków (ZAWSZE w tej kolejności)
 
+> ⚠️ **Ten skill ZAWSZE TWORZY taski** — nigdy nie jest „tylko planem". Slash `/plan` to INNY, wbudowany skill (plan-only, zapisuje plik do `.hermes/plans/` i NIC nie tworzy) — to nie jest task-architect. Jeśli trafi do Ciebie request planowania, kończysz utworzeniem tasków + dispatch.
+> ⚠️ **Oszczędny discovery:** użyj `kanban_list_tasks` + 1-2 celowanych `grep` na frazach z requestu. NIE czytaj całego repo w czacie (drenaż tokenów + minuty zwłoki) — głębokie czytanie kodu to robota workera, nie planisty. Cel: od requestu do utworzonych tasków w ≤ kilka wywołań.
+
 ### Krok 1: DISCOVER (zanim cokolwiek zaproponujesz)
 
 **Channel → board mapping** (z `config.yaml/routing.slack_channel_to_board`):
@@ -44,7 +47,7 @@ Twoim zadaniem jest **wymuszenie pełnego formatu** — nie pozwalaj sobie ani T
 
 **Co musisz zrobić zanim zaproponujesz plan:**
 
-1. **`kanban_list_tasks --board <board>`** — sprawdź istniejące taski (avoid duplicates, find related)
+1. **`kanban_list_tasks --board <board>`** — ZAWSZE NAJPIERW. **TWARDA ZASADA ANTY-DUPLIKAT:** jeśli na boardzie już istnieje task (lub komplet) o tym samym/zbliżonym tytule albo zakresie (np. ktoś — Cowork/Tomek — utworzył je ręcznie), NIE twórz drugiej kopii. Zamiast tego odpisz w wątku ID istniejących tasków i ewentualnie je uzupełnij (`kanban_update_task`). Tworzysz NOWE taski tylko gdy realnie brak pokrycia.
 2. **`git ls-files <repo>` + `grep`** na frazach z requestu Tomka — znajdź konkretne pliki/komponenty
 3. **Memory check** — przeczytaj `project_<board>.md` z `/home/tomek/.hermes/memories/` (znana wiedza o projekcie)
 4. **Slack thread context** — jeśli rozmowa toczyła się w wątku, przeczytaj ostatnie 5-10 wiadomości
@@ -66,7 +69,7 @@ Max 3 pytania. Jeśli masz pewność co do scope — pomiń ten krok.
 
 ### Krok 3: PLAN (propozycja w tabeli w wątku Slack)
 
-Zaproponuj breakdown **w wątku Slack jako tabela** — Tomek zobaczy zanim cokolwiek się utworzy:
+Ogłoś breakdown **w wątku Slack jako tabelę** — to INFORMACJA dla Tomka, NIE pytanie. Bezpośrednio po niej przechodzisz do Kroku 4 i tworzysz taski. NIE czekasz na odpowiedź.
 
 ```
 🎯 Plan dla #proj-X (board: X):
@@ -76,7 +79,7 @@ Zaproponuj breakdown **w wątku Slack jako tabela** — Tomek zobaczy zanim coko
 | 1 | Usunąć kartę statystyk z widoku mapy | UX cleanup mobile | `src/components/MapView.jsx:120-150` `.stats-card` w map-cards.css | S (codex, 30min) |
 | 2 | ... | ... | ... | ... |
 
-Tworzę je? (odpisz "tak" / "ok" / "dawaj")
+Tworzę je teraz i dispatchuję — bez czekania na potwierdzenie.
 ```
 
 **Limity:**
