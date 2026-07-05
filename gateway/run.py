@@ -4895,6 +4895,16 @@ class GatewayRunner:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                run_summaries: dict[int, str] = {}
+                                for ev in events:
+                                    if ev.kind != "completed" or ev.run_id is None:
+                                        continue
+                                    row = conn.execute(
+                                        "SELECT summary FROM task_runs WHERE id = ?",
+                                        (int(ev.run_id),),
+                                    ).fetchone()
+                                    if row and row["summary"]:
+                                        run_summaries[int(ev.run_id)] = str(row["summary"])
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -4906,6 +4916,7 @@ class GatewayRunner:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "run_summaries": run_summaries,
                                 })
                         finally:
                             conn.close()
@@ -4949,21 +4960,24 @@ class GatewayRunner:
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
                         if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
+                            # Przy zakończeniu zadania wysyłamy pełny handoff
+                            # workera, a nie tylko pierwszą linię. Na Slacku
+                            # ta wiadomość trafia jako nowy root w kanale (bez
+                            # thread_ts), żeby użytkownik mógł odpowiedzieć w
+                            # świeżym wątku zamiast przewijać stary wątek taska.
                             handoff = ""
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                h = payload_summary.strip().splitlines()[0][:200]
-                                handoff = f"\n{h}"
+                            run_summary = None
+                            if ev.run_id is not None:
+                                run_summary = d.get("run_summaries", {}).get(int(ev.run_id))
+                            if run_summary:
+                                handoff = f"\n\n{run_summary.strip()}"
+                            elif payload_summary:
+                                handoff = f"\n\n{payload_summary.strip()}"
                             elif task and task.result:
-                                r = task.result.strip().splitlines()[0][:160]
-                                handoff = f"\n{r}"
+                                handoff = f"\n\n{task.result.strip()}"
                             msg = (
                                 f"✔ {tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
@@ -4997,7 +5011,9 @@ class GatewayRunner:
                         else:
                             continue
                         metadata: dict[str, Any] = {}
-                        if sub.get("thread_id"):
+                        if sub.get("thread_id") and not (
+                            kind == "completed" and platform_str == "slack"
+                        ):
                             metadata["thread_id"] = sub["thread_id"]
                         sub_key = (
                             sub["task_id"], sub["platform"],

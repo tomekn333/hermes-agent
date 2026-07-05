@@ -5830,7 +5830,7 @@ def _default_spawn(
                         _c.extend(["--skills", sk])
             if _eng == "claude-api":
                 # wymuś provider anthropic (API) = ostatni szczebel; bez tego coder=codex
-                _c.extend(["-m", "claude-sonnet-4-6"])
+                _c.extend(["-m", "claude-opus-4-8"])
             _c.extend(["chat", "-q", prompt])
             cmd = _c
         else:

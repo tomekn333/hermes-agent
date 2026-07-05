@@ -969,25 +969,13 @@ class SlackAdapter(BasePlatformAdapter):
         gateway) over reply_to (which may be a child message's ts).
 
         When ``reply_in_thread`` is ``false`` in the platform extra config,
-        top-level channel messages receive direct channel replies instead of
-        thread replies.  Messages that originate inside an existing thread are
-        always replied to in-thread to preserve conversation context.
+        Slack sends assistant replies and notifications as new top-level
+        channel messages.  This intentionally includes messages that originated
+        from an existing Slack thread, so users can answer the final handoff by
+        starting a fresh thread on that new channel message.
         """
-        # When reply_in_thread is disabled (default: True for backward compat),
-        # only thread messages that are already part of an existing thread.
-        # For top-level channel messages, the inbound handler sets
-        # metadata.thread_id to the message's own ts as a session-keying
-        # fallback (see the `thread_ts = event.get("thread_ts") or ts` branch),
-        # so metadata alone can't distinguish a real thread reply from a
-        # top-level message. reply_to is the incoming message's own id, so
-        # when thread_id == reply_to the "thread" is synthetic and we reply
-        # directly in the channel instead.
         if not self.config.extra.get("reply_in_thread", True):
-            md = metadata or {}
-            existing_thread = md.get("thread_id") or md.get("thread_ts")
-            if existing_thread and reply_to and existing_thread == reply_to:
-                existing_thread = None
-            return existing_thread or None
+            return None
 
         if metadata:
             if metadata.get("thread_id"):

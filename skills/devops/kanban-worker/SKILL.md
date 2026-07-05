@@ -291,3 +291,69 @@ Gdy odpalasz długi proces (scrape, build, migracja) którego nie dożyjesz w sw
 4. Cron job_waiter (*/10) sam odblokuje task gdy PID-y umrą — dispatcher respawnuje workera, który dokończy wg Twojego komentarza.
 
 NIGDY nie pisz w powodzie blocka "odblokuj gdy skończą" / "czekam na review" — nikt tego ręcznie nie zrobi, praca stoi. Review-required jest ZAKAZANE (żelazna zasada auto-merge); jedyne 4 wyjątki: realne dane pacjentów AsiaCRM, destrukcyjne migracje DB, rotacja secrets, finanse.
+## KRYTYCZNE: REBASE BEFORE PR (zabezpieczenie przed konfliktami merge)
+
+**Reguła:** Każdy worker MUSI zachować świeży main + rebase przed PR.
+
+### Sekwencja git (OBLIGATORYJNA):
+
+```bash
+# 1. PRZED nowym branchem — sync main
+cd /home/tomek/projects/<repo>
+git fetch origin -q
+git checkout main
+git pull --ff-only origin main
+
+# 2. Stwórz feature branch z świeżego main
+git checkout -b feat/t_<task_id>-<short-desc>
+
+# 3. Pracuj, commituj
+git add -A && git commit -m "..."
+
+# 4. PRZED git push — rebase na świeżego origin/main
+git fetch origin -q
+git rebase origin/main
+
+# 5. Jeśli rebase failed → ABORT + kanban_block z reason="rebase_conflict"
+#    NIE force-push, NIE merge-commit, NIE zostawiaj brudnego branchu
+if [ $? -ne 0 ]; then
+  git rebase --abort
+  # kanban_block — niech zarchitekt rozdzieli prace
+  exit 1
+fi
+
+# 6. Push i PR
+git push -u origin feat/...
+gh pr create --base main --head feat/... --title "..." --body "..."
+gh pr merge --auto --squash --delete-branch
+```
+
+**Dlaczego:** Workery długo żyjące branche mają konflikty z main (134+ commitów wstecz po awariach). Mapy_automerge spamuje log "CONFLICTING" co minutę. Rozwiązanie: ZAWSZE start z fresh main, rebase przed PR.
+
+**Powiązane:** [[feedback-no-review-auto-merge-iron-rule]] (auto-merge gdy CI green).
+
+## ANTI-LOOP: nie re-read tego samego pliku (KRYTYCZNE — drenaż tokenów)
+
+**Problem zaobserwowany 2026-06-19:** worker czytał `dashboard.tsx` (~137k chars = ~37k tokenów) **10-12 razy** w jednej sesji → ~440k tokenów tylko na re-read tego samego pliku. Dodatkowo 5x context compaction → po każdym compaction worker "zapomina" i czyta plik znowu. To główny drain dla MAX MODE (Opus 4-8 + gpt-5.5).
+
+**Zasady (OBLIGATORYJNE):**
+
+1. **Każdy plik czytaj MAX 2 razy w sesji** — raz na początku (poznanie), drugi raz po zmianie (verify). NIE więcej.
+
+2. **Trzymaj kluczowe fragmenty w "pamięci roboczej"** — gdy zrobiłeś patch w X linii, NIE czytaj całego pliku żeby zweryfikować — zamiast tego użyj `sed -n 'START,ENDp' file` na konkretnym fragmencie (1-2k chars zamiast 137k).
+
+3. **Po `compact context` NIE wracaj do czytania plików** — zaplanowane już zmiany dokończ na podstawie obecnej pamięci. Jeśli faktycznie potrzeba czegoś, użyj `grep -n PATTERN file` (zwraca tylko linie, nie cały plik).
+
+4. **`review diff` MAX 2 razy** — sprawdź swój diff raz po patch, drugi raz przed `git commit`. Nie po każdej iteracji.
+
+5. **Gdy plik > 10k linii** używaj `head -50` / `tail -50` / `sed -n 'A,Bp'` zamiast pełnego Read.
+
+**Wymierne efekty:** prosty UI fix (zmiana CSS, jedna funkcja) powinien zająć:
+- 1-2 reads tego pliku
+- 5-10 tool calls total
+- <50k tokenów input
+- <5 minut
+
+Jeżeli przekraczasz te wartości — **STOP, kanban_block z reason="task too complex, needs split"**. Niech task-architect rozbije zadanie.
+
+**Sygnał alarmowy:** widzisz "compacting context… (3-cia kompresja)" → przerwij, complete z komentarzem "częściowy: kontekst się skończył, zobacz co już zrobiłem".

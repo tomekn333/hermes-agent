@@ -36,19 +36,31 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, platform=Platform.TELEGRAM):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {platform: adapter}
     runner._kanban_sub_fail_counts = {}
     return runner
 
 
-def _create_completed_subscription(summary="done once"):
+def _create_completed_subscription(
+    summary="done once",
+    *,
+    platform="telegram",
+    chat_id="chat-1",
+    thread_id=None,
+):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="notify once", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
         kb.complete_task(conn, tid, summary=summary)
         return tid
     finally:
@@ -104,6 +116,34 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+
+
+def test_slack_completed_notification_is_full_root_message(tmp_path, monkeypatch):
+    db_path = tmp_path / "slack-completed-root.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    summary = "pierwsza linia\n\ndruga linia z pełnego raportu\n- punkt akceptacyjny"
+    tid = _create_completed_subscription(
+        summary,
+        platform="slack",
+        chat_id="C-project",
+        thread_id="1783202712.581879",
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter, platform=Platform.SLACK)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    sent = adapter.sent[0]
+    assert sent["chat_id"] == "C-project"
+    assert tid in sent["text"]
+    assert "pierwsza linia" in sent["text"]
+    assert "druga linia z pełnego raportu" in sent["text"]
+    assert "- punkt akceptacyjny" in sent["text"]
+    assert "thread_id" not in sent["metadata"]
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):

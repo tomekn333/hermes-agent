@@ -244,3 +244,10 @@ Skill nie aktywuje się gdy:
 **Jakość taska = jakość workera.** Worker spędza średnio 30-150 iteracji na tasku. Każda minuta którą Ty (Hermes Opus 4-8) poświęcisz na precyzję — oszczędza godziny workerom (Codex 5.5 / Claude Code) plus zapobiega rework gdy Tomek odrzuca PR bo "to nie to o co prosiłem".
 
 **Zasada główna:** lepszy 1 dobrze opisany task niż 5 niedopracowanych.
+
+## Token-economy guidance for worker brief
+
+W generowanym **opisie taska** dodawaj wyraźną klauzulę dla workera:
+> **Token economy:** każdy plik czytaj max 2 razy. Po compact context — kończ, nie restartuj od read. Cel <50k tokens input. Jeśli za skomplikowane → kanban_block.
+
+Dla MAX MODE (Opus 4-8 + gpt-5.5 xhigh) re-reads są bardzo drogie. Zawsze tę klauzulę dodawaj.

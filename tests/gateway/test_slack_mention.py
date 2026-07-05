@@ -487,12 +487,13 @@ def test_config_bridges_slack_reply_in_thread(monkeypatch, tmp_path):
         metadata={"thread_id": "171.000"},
     ) is None
 
-    # Real thread replies (reply_to differs from thread parent) must still
-    # resolve to the parent thread so conversation context is preserved.
+    # Real thread replies are also posted as fresh channel messages when
+    # reply_in_thread=false.  This keeps final handoffs visible on the channel
+    # and lets the user answer by starting a new Slack thread from that handoff.
     assert adapter._resolve_thread_ts(
         reply_to="171.500",
         metadata={"thread_id": "171.000"},
-    ) == "171.000"
+    ) is None
 
 
 def test_config_bridges_slack_strict_mention(monkeypatch, tmp_path):
