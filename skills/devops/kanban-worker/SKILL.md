@@ -357,3 +357,9 @@ gh pr merge --auto --squash --delete-branch
 Jeżeli przekraczasz te wartości — **STOP, kanban_block z reason="task too complex, needs split"**. Niech task-architect rozbije zadanie.
 
 **Sygnał alarmowy:** widzisz "compacting context… (3-cia kompresja)" → przerwij, complete z komentarzem "częściowy: kontekst się skończył, zobacz co już zrobiłem".
+
+## Budzet iteracji — twarde zasady (2026-07-07, po 2x wypaleniu 120/120)
+1. **dashboard.tsx (6000+ linii) i globals.css (5000+ linii): ZAKAZ pelnego Read.** Wylacznie grep -n po symbolach + czytanie zakresow (sed -n 'A,Bp'). Jedno pelne Read tych plikow = ~10% budzetu.
+2. **Licz swoje iteracje.** Gdy przekroczysz ~70% budzetu bez gotowego rozwiazania: natychmiast zapisz czesciowy postep (commit na branchu + push) i wywolaj kanban_block z opisem: co ustalone, co zostalo, konkretny plan dokonczenia. Zablokowany task z diagnoza >>> spalony task bez sladu.
+3. **Zakres > 3 zmiany lub 'zdiagnozuj szeroko' = od razu kanban_block** z prosba o podzial taska. Waskie taski koncza sie w 5 minut (przyklad: t_688bf267), szerokie palą 120 iteracji i gina (t_e0b2bcd9).
+4. Fakty podane w tresci taska ("juz ustalone") traktuj jako prawde — nie weryfikuj ich ponownie, to marnuje iteracje.
