@@ -1709,6 +1709,25 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    if agent.provider == "claude-code-cli" or str(client_kwargs.get("base_url", "")).startswith("process://claude-code-cli"):
+        from agent.claude_cli_client import ClaudeCLIClient
+
+        # ClaudeCLIClient shells out to `claude -p`; it takes no httpx transport,
+        # retries, or keepalive http_client. Pass only the kwargs it understands
+        # so the generic OpenAI/keepalive plumbing below is bypassed entirely
+        # (mirrors the copilot-acp / gemini-native early returns above).
+        safe_kwargs = {
+            k: v for k, v in client_kwargs.items()
+            if k in {"api_key", "base_url", "default_headers", "command", "args", "cwd"}
+        }
+        client = ClaudeCLIClient(**safe_kwargs)
+        _ra().logger.info(
+            "Claude CLI client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

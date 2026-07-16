@@ -292,6 +292,9 @@ _PROVIDER_ALIASES = {
     "github-models": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "claude-cli": "claude-code-cli",
+    "claude-code": "claude-code-cli",
+    "anthropic-cli": "claude-code-cli",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -1634,6 +1637,12 @@ def _maybe_wrap_anthropic(
             return client_obj
     except ImportError:
         pass
+    try:
+        from agent.claude_cli_client import ClaudeCLIClient
+        if _safe_isinstance(client_obj, ClaudeCLIClient):
+            return client_obj
+    except ImportError:
+        pass
 
     # Explicit non-anthropic api_mode wins over URL heuristics.
     if api_mode and api_mode != "anthropic_messages":
@@ -2457,7 +2466,7 @@ def _validate_base_url(base_url: str) -> None:
     from urllib.parse import urlparse
 
     candidate = str(base_url or "").strip()
-    if not candidate or candidate.startswith("acp://"):
+    if not candidate or candidate.startswith("acp://") or candidate.startswith("process://"):
         return
     try:
         parsed = urlparse(candidate)
@@ -4489,6 +4498,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     try:
         from agent.copilot_acp_client import CopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
+            return sync_client, model
+    except ImportError:
+        pass
+    try:
+        from agent.claude_cli_client import ClaudeCLIClient
+        if isinstance(sync_client, ClaudeCLIClient):
             return sync_client, model
     except ImportError:
         pass

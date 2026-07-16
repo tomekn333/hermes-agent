@@ -521,9 +521,10 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
+        and agent.provider not in {"copilot-acp", "claude-code-cli"}
         and not str(agent.base_url or "").lower().startswith("acp://copilot")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
+        and not str(agent.base_url or "").lower().startswith("process://claude-code-cli")
         and not agent._is_azure_openai_url()
         and (
             agent._is_direct_openai_url()
@@ -994,6 +995,13 @@ def init_agent(
                 }
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
+                if agent.provider == "claude-code-cli":
+                    _cmd = getattr(_routed_client, "_command", None)
+                    _args = getattr(_routed_client, "_args", None)
+                    if _cmd:
+                        client_kwargs["command"] = _cmd
+                    if _args is not None:
+                        client_kwargs["args"] = list(_args)
                 # Preserve provider-specific headers the router set.  The
                 # OpenAI SDK stores caller-provided default_headers in
                 # _custom_headers; older/mocked clients may expose
