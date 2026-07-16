@@ -273,6 +273,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "copilot-acp": [
         "copilot-acp",
     ],
+    "claude-code-cli": [
+        "claude-opus-4-8",
+    ],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -1228,6 +1231,9 @@ _PROVIDER_ALIASES = {
     "github-model": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "claude-cli": "claude-code-cli",
+    "claude-code": "claude-code-cli",
+    "anthropic-cli": "claude-code-cli",
     "google": "gemini",
     "google-gemini": "gemini",
     "google-ai-studio": "gemini",
@@ -2388,6 +2394,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
+    if normalized == "claude-code-cli":
+        return list(_PROVIDER_MODELS.get("claude-code-cli", ["claude-opus-4-8"]))
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
