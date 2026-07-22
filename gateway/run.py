@@ -5010,6 +5010,11 @@ class GatewayRunner:
                             )
                         else:
                             continue
+                        # Slack only generates push/desktop notifications for a
+                        # real user mention (``<@U…>``).  The human-readable
+                        # ``@assignee`` tag above does not notify anyone.
+                        if platform_str == "slack" and sub.get("user_id"):
+                            msg = f"<@{sub['user_id']}> {msg}"
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id") and not (
                             kind == "completed" and platform_str == "slack"

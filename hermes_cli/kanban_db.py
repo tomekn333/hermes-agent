@@ -5836,6 +5836,29 @@ def _default_spawn(
         else:
             # None (wszystko wyczerpane) — nie spawnuj na ślepo; spawn-failure -> block
             raise RuntimeError("cc-router: brak dostępnego silnika (Codex/Claude Code/API wyczerpane)")
+    # RUN-STATS: sidecar <board>/logs/<task>.stats.json z silnikiem/modelem
+    # wybranym dla TEGO spawnu. Czyta go hermes_kanban_slack_notifier.py
+    # (statystyki w wiadomosci Done). Bez sieci; nigdy nie przerywa spawnu.
+    try:
+        import sys as _sys2
+        if "/home/tomek/.hermes" not in _sys2.path:
+            _sys2.path.insert(0, "/home/tomek/.hermes")
+        import run_stats as _rs
+        _engine = locals().get("_eng") or profile_arg
+        if task.model_override:
+            _model = task.model_override
+        elif _engine == "claude-code":
+            _model = os.environ.get("CC_WORKER_MODEL", "claude-sonnet-4-6")
+        elif _engine == "codex":
+            _model = "gpt-5.6-sol"
+        elif _engine == "claude-api":
+            _model = "claude-opus-4-8"
+        else:
+            _model = ""
+        _rs.record_spawn(resolved_board, task.id, _engine, _model)
+    except Exception:
+        pass
+
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

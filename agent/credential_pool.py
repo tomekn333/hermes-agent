@@ -520,10 +520,12 @@ class CredentialPool:
             # another process means our entry's pair is consumed/stale.
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
-            if store_access and (
-                store_access != entry_access
-                or (store_refresh and store_refresh != entry_refresh)
-            ):
+            if (
+                store_access and (
+                    store_access != entry_access
+                    or (store_refresh and store_refresh != entry_refresh)
+                )
+            ) or (not store_access and store_refresh and store_refresh != entry_refresh):
                 logger.debug(
                     "Pool entry %s: syncing Codex tokens from auth.json "
                     "(refreshed by another process)",
@@ -801,23 +803,29 @@ class CredentialPool:
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
-                # Adopt fresher tokens from auth.json before spending the
-                # refresh_token — single-use tokens consumed by another Hermes
-                # process sharing the same auth.json singleton would otherwise
-                # trigger ``refresh_token_reused`` on the next POST.
-                synced = self._sync_codex_entry_from_auth_store(entry)
-                if synced is not entry:
-                    entry = synced
-                refreshed = auth_mod.refresh_codex_oauth_pure(
-                    entry.access_token,
-                    entry.refresh_token,
-                )
-                updated = replace(
-                    entry,
-                    access_token=refreshed["access_token"],
-                    refresh_token=refreshed["refresh_token"],
-                    last_refresh=refreshed.get("last_refresh"),
-                )
+                # Single-flight Codex refreshes across gateway requests and
+                # Hermes processes: re-check auth.json under the auth-store
+                # lock before spending the single-use refresh_token.
+                with _auth_store_lock(timeout_seconds=max(float(auth_mod.AUTH_LOCK_TIMEOUT_SECONDS), 25.0)):
+                    synced = self._sync_codex_entry_from_auth_store(entry)
+                    if synced is not entry:
+                        entry = synced
+                    if not force and not self._entry_needs_refresh(entry):
+                        return entry
+                    logger.info(
+                        "Codex OAuth pool entry %s access token missing/expiring; refreshing on demand",
+                        entry.id,
+                    )
+                    refreshed = auth_mod.refresh_codex_oauth_pure(
+                        str(entry.access_token or ""),
+                        str(entry.refresh_token or ""),
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        last_refresh=refreshed.get("last_refresh"),
+                    )
             elif self.provider == "xai-oauth":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another

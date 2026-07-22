@@ -79,6 +79,55 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
 
 @pytest.mark.asyncio
+async def test_slack_notifier_mentions_subscriber_for_real_notification(kanban_home):
+    """Slack API messages need a real ``<@USER_ID>`` mention to notify."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="notify Tomek", assignee="worker1")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="C123",
+            thread_id="171.000001",
+            user_id="U0B5A8YPL9W",
+        )
+        kb.complete_task(conn, tid, result="done")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    runner.adapters = {Platform.SLACK: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_called_once()
+    call_msg = fake_adapter.send.call_args[0][1]
+    assert call_msg.startswith("<@U0B5A8YPL9W> ✔ @worker1 Kanban")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ["gave_up", "crashed", "timed_out"])
 async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     """

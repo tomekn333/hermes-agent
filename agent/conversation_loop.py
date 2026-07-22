@@ -1157,9 +1157,10 @@ def run_conversation(
                 # stream.  Mirror the ACP exclusion used for Responses
                 # API upgrade (lines ~1083-1085).
                 elif (
-                    agent.provider == "copilot-acp"
+                    agent.provider in {"copilot-acp", "claude-code-cli"}
                     or str(agent.base_url or "").lower().startswith("acp://copilot")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
+                    or str(agent.base_url or "").lower().startswith("process://claude-code-cli")
                 ):
                     _use_streaming = False
                 elif not agent._has_stream_consumers():

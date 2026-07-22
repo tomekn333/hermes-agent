@@ -107,6 +107,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CLAUDE_CODE_CLI_BASE_URL = "process://claude-code-cli"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -245,6 +246,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "claude-code-cli": ProviderConfig(
+        id="claude-code-cli",
+        name="Claude Code CLI",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CLAUDE_CODE_CLI_BASE_URL,
+        base_url_env_var="CLAUDE_CLI_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1902,7 +1910,13 @@ def _nous_effective_provider_state(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _codex_access_token_is_expiring(access_token: Any, skew_seconds: int) -> bool:
-    claims = _decode_jwt_claims(access_token)
+    # A missing/empty access token can never authenticate; treat it as
+    # already expired so callers refresh it from the refresh_token instead
+    # of crash-looping on "Codex auth is missing access_token".
+    token = str(access_token or "").strip()
+    if not token:
+        return True
+    claims = _decode_jwt_claims(token)
     exp = claims.get("exp")
     if not isinstance(exp, (int, float)):
         return False
@@ -3212,12 +3226,22 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     if not isinstance(access_token, str) or not access_token.strip():
-        raise AuthError(
-            "Codex auth is missing access_token. Run `hermes auth` to re-authenticate.",
-            provider="openai-codex",
-            code="codex_auth_missing_access_token",
-            relogin_required=True,
-        )
+        # A usable refresh_token can mint a fresh access token — let callers
+        # (resolve_codex_runtime_credentials / credential pool) refresh on
+        # demand instead of hard-failing into a worker crash-loop.
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            raise AuthError(
+                "Codex auth is missing access_token. Run `hermes auth` to re-authenticate.",
+                provider="openai-codex",
+                code="codex_auth_missing_access_token",
+                relogin_required=True,
+            )
+        tokens = dict(tokens)
+        tokens["access_token"] = ""
+        return {
+            "tokens": tokens,
+            "last_refresh": state.get("last_refresh"),
+        }
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
             "Codex auth is missing refresh_token. Run `hermes auth` to re-authenticate.",
@@ -5924,30 +5948,61 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
-        raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
-            provider=provider_id,
-            code="missing_copilot_cli",
+    if provider_id == "copilot-acp":
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
         )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        resolved_command = shutil.which(command) if command else None
+        if not resolved_command and not base_url.startswith("acp+tcp://"):
+            raise AuthError(
+                f"Could not find the Copilot CLI command '{command}'. "
+                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+                provider=provider_id,
+                code="missing_copilot_cli",
+            )
+        return {
+            "provider": provider_id,
+            "api_key": "copilot-acp",
+            "base_url": base_url.rstrip("/"),
+            "command": resolved_command or command,
+            "args": args,
+            "source": "process",
+        }
 
-    return {
-        "provider": provider_id,
-        "api_key": "copilot-acp",
-        "base_url": base_url.rstrip("/"),
-        "command": resolved_command or command,
-        "args": args,
-        "source": "process",
-    }
+    if provider_id == "claude-code-cli":
+        command = (
+            os.getenv("HERMES_CLAUDE_CLI_COMMAND", "").strip()
+            or os.getenv("CLAUDE_CLI_PATH", "").strip()
+            or "claude"
+        )
+        raw_args = os.getenv("HERMES_CLAUDE_CLI_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
+        resolved_command = shutil.which(command) if command else None
+        if not resolved_command:
+            raise AuthError(
+                f"Could not find the Claude CLI command '{command}'. "
+                "Install Claude Code CLI or set HERMES_CLAUDE_CLI_COMMAND/CLAUDE_CLI_PATH.",
+                provider=provider_id,
+                code="missing_claude_cli",
+            )
+        return {
+            "provider": provider_id,
+            "api_key": "claude-code-cli",
+            "base_url": base_url.rstrip("/"),
+            "command": resolved_command or command,
+            "args": args,
+            "source": "process",
+        }
+
+    raise AuthError(
+        f"External-process provider '{provider_id}' is registered but has no resolver.",
+        provider=provider_id,
+        code="unsupported_external_process",
+    )
 
 
 # =============================================================================
