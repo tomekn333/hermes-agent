@@ -554,6 +554,9 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     # via ``HERMES_MEDIA_ALLOW_DIRS``. Test fixtures live under ``tmp_path``,
     # so allowlist it for the duration of the test.
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    # Push gate (local patch) checks the *test runner's* cwd repo — not what
+    # these tests exercise (artifact delivery). Disable it explicitly.
+    monkeypatch.setenv("HERMES_SKIP_PUSH_GATE", "1")
 
     # Materialize real files so os.path.isfile passes inside the helper.
     chart_path = tmp_path / "q3-revenue.png"
@@ -645,6 +648,9 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Allow ``tmp_path`` through the media-delivery safety filter. See the
     # companion test for the full explanation.
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    # Push gate (local patch) checks the *test runner's* cwd repo — not what
+    # these tests exercise (artifact delivery). Disable it explicitly.
+    monkeypatch.setenv("HERMES_SKIP_PUSH_GATE", "1")
 
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
