@@ -2657,6 +2657,23 @@ class BasePlatformAdapter(ABC):
             return response.text, int(ttl or 0)
         return response, 0
 
+    async def _send_bounded(self, *, chat_id, content, reply_to=None, metadata=None, timeout: float = 90.0) -> "SendResult":
+        """self.send() z twardym limitem czasu.
+
+        FIX 2026-07-28: wysyłka do Slacka potrafiła zawisnąć bez timeoutu
+        (ostatni log: "Sending response…", brak wyjątku, brak dostarczenia,
+        brak informacji dla użytkownika). Timeout zamieniamy na SendResult
+        retryable=True, więc wpada w istniejący mechanizm retry + notice.
+        """
+        try:
+            return await asyncio.wait_for(
+                self.send(chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[%s] send() hard-timeout after %.0fs (chat=%s)", self.name, timeout, chat_id)
+            return SendResult(success=False, error=f"send timed out after {timeout:.0f}s", retryable=True)
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -2675,7 +2692,7 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
-        result = await self.send(
+        result = await self._send_bounded(
             chat_id=chat_id,
             content=content,
             reply_to=reply_to,
@@ -2702,7 +2719,7 @@ class BasePlatformAdapter(ABC):
                     self.name, attempt, max_retries, delay, error_str,
                 )
                 await asyncio.sleep(delay)
-                result = await self.send(
+                result = await self._send_bounded(
                     chat_id=chat_id,
                     content=content,
                     reply_to=reply_to,
@@ -2722,14 +2739,14 @@ class BasePlatformAdapter(ABC):
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    await self._send_bounded(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata, timeout=30)
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self.send(
+        fallback_result = await self._send_bounded(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
             reply_to=reply_to,
