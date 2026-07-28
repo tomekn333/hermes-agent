@@ -1042,6 +1042,20 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+    # HARDENING 2026-07-23 (fix7b): rate-limit corrupt snapshots. Every failed
+    # connect() (notifier tick, dispatcher, workers - many per second during an
+    # outage) used to create its own copy: 3728 files / 2.7 GB on 2026-07-23.
+    # Keep at most one snapshot per 10 minutes per DB basename.
+    import time as _time
+    try:
+        for _existing in parent.glob(base_name + ".corrupt.*"):
+            try:
+                if _time.time() - _existing.stat().st_mtime < 600:
+                    return None
+            except OSError:
+                continue
+    except OSError:
+        pass
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = parent / f"{base_name}.corrupt.{stamp}.bak"
     # Defensive: candidate must still be inside parent after construction.
@@ -5011,6 +5025,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if row is None:
         return None
 
+    # FIX 2026-07-28: zadania recenzenckie ("review" w tytule) z definicji
+    # operują na ISTNIEJĄCYM PR — guard active_pr blokował każdy re-review
+    # po nieudanym przejściu (handoff w komentarzu zawiera URL PR), więc
+    # task wisiał w ready do końca 24h okna. Dla takich zadań pomijamy
+    # wyłącznie regułę active_pr (blocker_auth i recent_success zostają).
+    _title_row = conn.execute(
+        "SELECT title FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    _is_review_task = bool(
+        _title_row and _title_row["title"]
+        and re.search(r"review", _title_row["title"], re.IGNORECASE)
+    )
+
     # 1. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
@@ -5028,6 +5055,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 3. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    if _is_review_task:
+        return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
@@ -5633,6 +5662,68 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     return False
 
 
+# SKILL-SYNC PATCH (2026-07-23): per-task skills byly przekazywane w ciemno do
+# CLI workera; nazwa nierozwiazywalna pod HERMES_HOME workera jest fatalna na
+# starcie ("Error: Unknown skill(s): ..."), co crash-loopowalo taski (incydent:
+# hermes-mapy-maintenance istnial tylko w root home, a workerzy codex startuja
+# pod profiles/coder). Przed dodaniem flagi --skills upewnij sie, ze skill
+# rozwiazuje sie w home workera: jesli brak, dokopiuj z root home; jesli nadal
+# brak, pomin flage i zaloguj ostrzezenie zamiast spawnowac skazanego workera.
+def _ensure_task_skill_available(skill_name, hermes_home):
+    import shutil as _shutil
+    from pathlib import Path as _Path
+    try:
+        name = str(skill_name or "").strip()
+        if not name or "/" in name or "\\" in name or ".." in name:
+            return False
+        base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+        skills_root = base / "skills"
+        try:
+            for skill_md in skills_root.rglob(name + "/SKILL.md"):
+                if skill_md.is_file():
+                    return True
+        except OSError:
+            pass
+        root_skills = _Path.home() / ".hermes" / "skills"
+        src_dir = None
+        try:
+            for skill_md in root_skills.rglob(name + "/SKILL.md"):
+                if skill_md.is_file():
+                    src_dir = skill_md.parent
+                    break
+        except OSError:
+            src_dir = None
+        if src_dir is None:
+            return False
+        try:
+            rel = src_dir.relative_to(root_skills)
+        except ValueError:
+            rel = _Path(name)
+        dest = skills_root / rel
+        if dest.exists():
+            return (dest / "SKILL.md").is_file()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _shutil.copytree(src_dir, dest)
+        _log.info(
+            "kanban skill-sync: copied skill %r from %s to %s", name, src_dir, dest
+        )
+        return (dest / "SKILL.md").is_file()
+    except Exception:
+        _log.warning(
+            "kanban skill-sync: failed to ensure skill %r for home %r",
+            skill_name, hermes_home, exc_info=True,
+        )
+        return False
+
+
+def _skill_sync_warn(task_id, skill_name):
+    _log.warning(
+        "kanban skill-sync: skill %r nie rozwiazuje sie dla workera taska %s "
+        "(brak takze w root home) - pomijam flage --skills zamiast crashowac",
+        skill_name, task_id,
+    )
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -5786,7 +5877,11 @@ def _default_spawn(
     if task.skills:
         for sk in task.skills:
             if sk and sk != "kanban-worker":
-                cmd.extend(["--skills", sk])
+                # SKILL-SYNC PATCH: patrz _ensure_task_skill_available
+                if _ensure_task_skill_available(sk, env.get("HERMES_HOME")):
+                    cmd.extend(["--skills", sk])
+                else:
+                    _skill_sync_warn(task.id, sk)
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([
@@ -5827,7 +5922,11 @@ def _default_spawn(
             if task.skills:
                 for sk in task.skills:
                     if sk and sk != "kanban-worker":
-                        _c.extend(["--skills", sk])
+                        # SKILL-SYNC PATCH: patrz _ensure_task_skill_available
+                        if _ensure_task_skill_available(sk, env.get("HERMES_HOME")):
+                            _c.extend(["--skills", sk])
+                        else:
+                            _skill_sync_warn(task.id, sk)
             if _eng == "claude-api":
                 # wymuś provider anthropic (API) = ostatni szczebel; bez tego coder=codex
                 _c.extend(["-m", "claude-opus-4-8"])
