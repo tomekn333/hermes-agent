@@ -30,6 +30,14 @@ Analiza kopii wykazała m.in.:
 
 Zwykłe `SQLITE_BUSY`, brak jawnego `PRAGMA busy_timeout` ani współdzielenie jednego obiektu `sqlite3.Connection` między wątkami nie wyjaśniają fizycznego nadpisania stron. Połączenia produkcyjne mają domyślne `check_same_thread=True`, timeout 30 s i używają `BEGIN IMMEDIATE` dla transakcji wielozapisowych.
 
+### Potwierdzona ścieżka unlinkowania WAL/SHM
+
+Audyt wykazał drugi, niezależny defekt: Pythonowe `sqlite3.Connection.__exit__()` wykonuje commit/rollback, lecz **nie zamyka połączenia**. Długowieczny gateway uruchamia część komend slash in-process; ścieżka `gateway.run_slash` → funkcje `hermes_cli.kanban`/`kanban_decompose`/`kanban_specify` → `with kb.connect()` opuszczała blok bez `conn.close()`. W efekcie gateway zgromadził setki deskryptorów `kanban.db`, `kanban.db-wal` i `kanban.db-shm`.
+
+Sam unlink nie pochodził z `rm`, `Path.unlink()` ani skryptu operatorskiego. Wąskie przeszukanie repo i `/home/tomek/scripts` nie znalazło takiej operacji. Wykonuje go wewnętrzny cleanup SQLite przy rzeczywistym zamknięciu ostatniego widocznego połączenia: `sqlite3_close` → pager/WAL close (`sqlite3WalClose`) → VFS delete `-wal`, a unmap współdzielonej pamięci (`sqlite3OsShmUnmap(..., deleteFlag=1)`) usuwa `-shm`. Minimalny reproduktor potwierdził: po zamknięciu drugiego połączenia sidecary pozostają, a po zamknięciu ostatniego oba znikają. Opóźnione finalizowanie wyciekłych obiektów przez GC uruchamiało tę ścieżkę w nieprzewidywalnym momencie; w połączeniu z błędnym WAL→DELETE zwiększało ryzyko rozdzielenia aktywnych deskryptorów od nazw plików w katalogu.
+
+Poprawka `connect_closing()` opakowuje `connect()` w `contextlib.closing`, a wszystkie produkcyjne miejsca używające kontekstu zostały na nią przeniesione. Test regresyjny wymaga, aby próba użycia połączenia po wyjściu z bloku kończyła się `sqlite3.ProgrammingError` także przy wyjątku w ciele bloku.
+
 ## Poprawka
 
 Commit `59efaee36` (`fix(state): never silently downgrade WAL to DELETE on transient EIO`) wprowadza dwie warstwy ochrony:
