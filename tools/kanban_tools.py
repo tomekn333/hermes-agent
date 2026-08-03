@@ -476,8 +476,23 @@ def _handle_complete(args: dict, **kw) -> str:
         import os as _os, subprocess as _sp
         if _os.environ.get("HERMES_SKIP_PUSH_GATE") == "1":
             return None
+        # FIX 2026-08-03: sprawdzaj WORKSPACE workera, nie biezacy cwd.
+        # Worktree zadania lezy fizycznie wewnatrz repo hermes-agent
+        # (~/.hermes/hermes-agent/.worktrees/<task>), wiec gdy cwd procesu
+        # zdryfowal poza worktree, git rozwiazywal sie do repo nadrzednego
+        # i bramka blokowala completion z powodu CUDZYCH, niezwiazanych
+        # zmian (false positive na t_9fb4660c: praca byla zmergowana
+        # i wdrozona, a karta i tak zostala blocked).
+        _ws = _os.environ.get("HERMES_KANBAN_WORKSPACE") or ""
+        _cwd = _os.getcwd()
+        if _ws and _os.path.isdir(_ws):
+            _probe = _sp.run(["git", "rev-parse", "--is-inside-work-tree"],
+                             cwd=_ws, capture_output=True, text=True, timeout=20)
+            if _probe.returncode == 0 and _probe.stdout.strip() == "true":
+                _cwd = _ws
+
         def _g(*a):
-            return _sp.run(["git", *a], cwd=_os.getcwd(),
+            return _sp.run(["git", *a], cwd=_cwd,
                            capture_output=True, text=True, timeout=20)
         try:
             r = _g("rev-parse", "--is-inside-work-tree")
@@ -491,6 +506,18 @@ def _handle_complete(args: dict, **kw) -> str:
             cont = _g("branch", "-r", "--contains", head)
             if not any(ln.strip().startswith("origin/")
                        for ln in cont.stdout.splitlines()):
+                # HARDENING 2026-07-23 (fix8): squash-merge false positive.
+                # After `gh pr merge --squash` the branch HEAD SHA is never
+                # contained in origin/*, although its content IS on the
+                # default branch. If HEAD has no content difference vs the
+                # fetched origin default branch, the work is safely on
+                # origin - do not block completion.
+                _g("fetch", "origin", "--quiet")
+                for _def in ("origin/main", "origin/master"):
+                    if _g("rev-parse", "--verify", "--quiet", _def).returncode == 0:
+                        if _g("diff", "--quiet", "HEAD", _def).returncode == 0:
+                            return None
+                        break
                 br = _g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
                 return ("unpushed", top, br)
             return None
@@ -515,6 +542,9 @@ def _handle_complete(args: dict, **kw) -> str:
             "origin, so this work would be lost on the next deploy. Run "
             "git push -u origin " + _detail + " and open a PR, then retry "
             "kanban_complete. The task is still in-flight (no state change). "
+            "If your PR was ALREADY squash-merged (gh pr view <nr> shows "
+            "MERGED), run: git fetch origin && git switch main && git pull, "
+            "then retry kanban_complete - do NOT re-push the old branch. "
             "For a legit no-push task set HERMES_SKIP_PUSH_GATE=1 and retry."
         )
 
