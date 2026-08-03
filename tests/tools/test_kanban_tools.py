@@ -1157,7 +1157,9 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 4_096, (
+    # local-patches 2026-08-03: gorna granica podniesiona z 4_096 po dodaniu
+    # sekcji "Checkpoint-commit (HARD RULE)" (incydent t_8e92fe70, asiacrm).
+    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
