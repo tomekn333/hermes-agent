@@ -597,6 +597,26 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+# local patch 2026-08-17 (Cowork/Tomek): blokady, ktore w istocie sa
+# przekazaniem pracy karcie potomnej review/merge/release.
+_REVIEW_HANDOFF_WORDS = (
+    "review", "merge", "release", "handoff", "wdroz", "przegladu",
+)
+# security-review-required jest wg WORKER-RULES.md legalnym powodem blokady.
+_SECURITY_WORDS = (
+    "security", "sekret", "secret", "api key", "api_key", "api-key",
+    "review-failed", "failed", "fail:", "odrzuc",
+)
+
+
+def _is_review_handoff_reason(reason) -> bool:
+    """Przekazanie pracy dalej, czy realna prosba do czlowieka?"""
+    text = str(reason or "").lower()
+    if any(w in text for w in _SECURITY_WORDS):
+        return False
+    return any(w in text for w in _REVIEW_HANDOFF_WORDS)
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
@@ -614,6 +634,27 @@ def _handle_block(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # local patch 2026-08-17: rodzic konczacy jako blocked NIGDY
+            # nie zwolni karty potomnej - recompute_ready wymaga rodzica w
+            # done/archived, a complete broni wymog zmergowanej galezi.
+            if _is_review_handoff_reason(reason):
+                kids = [
+                    row[0] for row in conn.execute(
+                        "SELECT child_id FROM task_links WHERE parent_id = ?",
+                        (tid,),
+                    ).fetchall()
+                ]
+                if kids:
+                    return tool_error(
+                        "kanban_block odrzucone: powod wyglada na przekazanie "
+                        "pracy do review/merge/release, a to zadanie ma karte "
+                        "potomna (" + ", ".join(kids) + "). Rodzic w stanie "
+                        "blocked NIGDY nie zwolni dziecka, wiec caly potok "
+                        "stanalby w miejscu. Zakoncz przez kanban_complete("
+                        "summary=..., metadata=...) z pelnym handoffem. Merge "
+                        "wstrzymuje stan PR-a (draft + etykieta hold), a NIE "
+                        "status tej karty."
+                    )
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
