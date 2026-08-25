@@ -85,8 +85,20 @@ _XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7")
 _ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7")
 
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
-# This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
-_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7")
+# To byl kontrakt Opus 4.7 i komentarz zapowiadal, ze nowsze modele pojda tak samo
+# — ale nikt listy nie dopisal. 2026-08-25: `vision_analyze` na claude-opus-5
+# dostawalo HTTP 400 "`temperature` is deprecated for this model", bo opus-5 nie
+# pasowal do zadnego wzorca. Opus-5 jest teraz delegacja i fallbackiem wszedzie,
+# wiec kazde wywolanie pomocnicze z jawna temperatura sie wywracalo.
+# Dopisane: Opus 4.8 oraz cala generacja Claude 5 (opus/sonnet/haiku/fable).
+_NO_SAMPLING_PARAMS_SUBSTRINGS = (
+    "4-7", "4.7",
+    "4-8", "4.8",
+    "opus-5", "opus.5",
+    "sonnet-5", "sonnet.5",
+    "haiku-5", "haiku.5",
+    "fable-5", "fable.5",
+)
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 
 # ── Max output token limits per Anthropic model ───────────────────────
