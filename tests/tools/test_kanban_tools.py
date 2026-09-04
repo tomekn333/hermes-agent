@@ -44,6 +44,13 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
 # Handler happy paths
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _skip_push_gate(monkeypatch):
+    # local-patches: the push gate checks the runner's own repo cwd, not the
+    # object under test — disable it for the tool-level tests.
+    monkeypatch.setenv("HERMES_SKIP_PUSH_GATE", "1")
+
 @pytest.fixture
 def worker_env(monkeypatch, tmp_path):
     """Simulate being a worker: HERMES_HOME isolated, HERMES_KANBAN_TASK set

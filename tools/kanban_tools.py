@@ -658,6 +658,98 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+
+# ---- local-patches (port z 0.14: a2d74982 + 09af1a17 + fix8 2026-07-23) ----
+# HARD GATE: block completion while work is uncommitted or unpushed. Runs in
+# the worker's own process so the checked directory is the repo/worktree the
+# worker actually edited (HERMES_KANBAN_WORKSPACE first, cwd as fallback).
+# Catches both failure modes that silently lose work on auto-deploy:
+# (a) live --reload edits never committed, (b) commits never pushed to origin.
+# Fail-open on any error / non-repo task so it can never brick a legitimate
+# completion. Escape hatch: HERMES_SKIP_PUSH_GATE=1.
+def _push_gate():
+    import subprocess as _sp
+    if os.environ.get("HERMES_SKIP_PUSH_GATE") == "1":
+        return None
+    # Only enforce inside a dispatched worker (HERMES_KANBAN_TASK is set by the
+    # dispatcher). CLI / dashboard / test-suite completions are not gated.
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    _ws = os.environ.get("HERMES_KANBAN_WORKSPACE") or ""
+    try:
+        _cwd = os.getcwd()
+    except OSError:
+        _cwd = _ws or None
+    if _ws and os.path.isdir(_ws):
+        try:
+            _probe = _sp.run(["git", "rev-parse", "--is-inside-work-tree"],
+                             cwd=_ws, capture_output=True, text=True, timeout=20)
+            if _probe.returncode == 0 and _probe.stdout.strip() == "true":
+                _cwd = _ws
+        except Exception:
+            pass
+    if not _cwd:
+        return None
+
+    def _g(*a):
+        return _sp.run(["git", *a], cwd=_cwd,
+                       capture_output=True, text=True, timeout=20)
+    try:
+        r = _g("rev-parse", "--is-inside-work-tree")
+        if r.returncode != 0 or r.stdout.strip() != "true":
+            return None
+        top = _g("rev-parse", "--show-toplevel").stdout.strip()
+        st = _g("status", "--porcelain", "--untracked-files=no")
+        if st.returncode == 0 and st.stdout.strip():
+            return ("uncommitted", top, st.stdout.strip()[:400])
+        head = _g("rev-parse", "HEAD").stdout.strip()
+        cont = _g("branch", "-r", "--contains", head)
+        if not any(ln.strip().startswith("origin/")
+                   for ln in cont.stdout.splitlines()):
+            # squash-merge false positive: after `gh pr merge --squash` the
+            # branch HEAD SHA is never contained in origin/*, although its
+            # content IS on the default branch.
+            _g("fetch", "origin", "--quiet")
+            for _def in ("origin/main", "origin/master"):
+                if _g("rev-parse", "--verify", "--quiet", _def).returncode == 0:
+                    if _g("diff", "--quiet", "HEAD", _def).returncode == 0:
+                        return None
+                    break
+            br = _g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            return ("unpushed", top, br)
+        return None
+    except Exception:
+        return None
+
+
+def _push_gate_error():
+    """tool_error for a failed push gate, or None when the gate passes."""
+    _gate = _push_gate()
+    if not _gate:
+        return None
+    _kind, _top, _detail = _gate
+    if _kind == "uncommitted":
+        return tool_error(
+            "kanban_complete blocked: uncommitted changes in the repo at "
+            + _top + " (" + _detail + "). Auto-deploy overwrites uncommitted "
+            "live edits, so this is NOT done. Commit AND push your work "
+            "(worktree: git push -u origin <branch> + open a PR; main repo: "
+            "git push origin <branch>), then retry kanban_complete. The task "
+            "is still in-flight (no state change). If this task legitimately "
+            "changes no tracked files, set HERMES_SKIP_PUSH_GATE=1 and retry."
+        )
+    return tool_error(
+        "kanban_complete blocked: branch '" + _detail + "' at " + _top
+        + " has commits not on origin (unpushed). Auto-deploy only sees "
+        "origin, so this work would be lost on the next deploy. Run "
+        "git push -u origin " + _detail + " and open a PR, then retry "
+        "kanban_complete. The task is still in-flight (no state change). "
+        "If your PR was ALREADY squash-merged (gh pr view <nr> shows "
+        "MERGED), run: git fetch origin && git switch main && git pull, "
+        "then retry kanban_complete - do NOT re-push the old branch. "
+        "For a legit no-push task set HERMES_SKIP_PUSH_GATE=1 and retry."
+    )
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -671,6 +763,9 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    gate_err = _push_gate_error()
+    if gate_err:
+        return gate_err
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
