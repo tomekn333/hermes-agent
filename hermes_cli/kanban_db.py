@@ -9713,6 +9713,28 @@ def _github_pr_state(url: str) -> "Optional[str]":
     return state
 
 
+
+def _kanban_worker_skill_available(hermes_home) -> bool:
+    """local-patches: True if a ``kanban-worker`` skill resolves for the home
+    the spawned worker will run under (profile homes have their own
+    ``skills/``). Preloading a missing skill would abort the worker at CLI
+    startup, so the flag is gated on actual resolvability."""
+    from pathlib import Path as _Path
+
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
+        return True
+    try:
+        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
+            if skill_md.is_file():
+                return True
+    except OSError:
+        pass
+    return False
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -11061,6 +11083,16 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
+    # local-patches (2026-09-04): upstream #50473 folded the bundled
+    # kanban-worker skill into KANBAN_GUIDANCE. Our ~/.hermes/skills and
+    # profiles/*/skills still carry a customised devops/kanban-worker/SKILL.md
+    # (project hard rules: push-before-complete, checkpoint-commit, sub-agents
+    # must never touch the card, long-job pattern). Keep force-loading it when
+    # it resolves under the worker's HERMES_HOME.
+    if _kanban_worker_skill_available(env.get("HERMES_HOME")) and not (
+        task.skills and "kanban-worker" in task.skills
+    ):
+        cmd.extend(["--skills", "kanban-worker"])
     if task.skills:
         for sk in task.skills:
             if sk:
