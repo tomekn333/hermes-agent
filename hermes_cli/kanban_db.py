@@ -73,6 +73,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import pathlib
 import re
 import secrets
 import shutil
@@ -2918,6 +2919,98 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class UnmergedBranchError(RuntimeError):
+    """Zamkniecie zadania odrzucone: galaz zadania nie jest w galezi domyslnej."""
+
+    def __init__(self, branch: str, task_id: str):
+        self.branch = branch
+        self.task_id = task_id
+        super().__init__(
+            f"Nie moge zamknac {task_id}: galaz '{branch}' nie zostala zmergowana "
+            f"do galezi domyslnej. Ukonczone review NIE jest ukonczonym zadaniem — "
+            f"otworz PR, doprowadz build do zieleni, zmerguj i dopiero wtedy zamykaj."
+        )
+
+
+def _unmerged_branch_for_task(conn, task_id):
+    """Nazwa galezi, jesli da sie POZYTYWNIE stwierdzic, ze wyprzedza galaz
+    domyslna (praca nie zostala zmergowana). Przy jakiejkolwiek niepewnosci
+    zwraca None — gate ma lapac realny blad, a nie zatrzymywac prace.
+    """
+    row = conn.execute(
+        "SELECT branch_name, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    branch = (row["branch_name"] or "").strip()
+    workspace = (row["workspace_path"] or "").strip()
+    if not branch or not workspace or not os.path.isdir(workspace):
+        return None
+    git_bin = shutil.which("git")
+    gh_bin = shutil.which("gh")
+    if not git_bin or not gh_bin:
+        return None
+    try:
+        remote = subprocess.run(
+            [git_bin, "-C", workspace, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if remote.returncode != 0:
+            return None
+        slug = re.search(
+            r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$",
+            (remote.stdout or "").strip(),
+        )
+        if not slug:
+            return None
+        repo = slug.group(1) + "/" + slug.group(2)
+        base = subprocess.run(
+            [gh_bin, "repo", "view", repo, "--json", "defaultBranchRef",
+             "-q", ".defaultBranchRef.name"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if base.returncode != 0:
+            return None
+        default_branch = (base.stdout or "").strip()
+        if not default_branch or default_branch == branch:
+            return None
+        # SQUASH MERGE: po scaleniu przez squash commity galezi NIE staja sie
+        # przodkami main, wiec `compare` nadal raportuje "ahead"/"diverged".
+        # Dlatego najpierw pytamy o PR-y z tej galezi — zmergowany PR jest
+        # rozstrzygajacym dowodem, ze praca weszla.
+        prs = subprocess.run(
+            [gh_bin, "pr", "list", "--repo", repo, "--head", branch,
+             "--state", "all", "--limit", "20", "--json", "state",
+             "-q", "[.[].state] | join(\",\")"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if prs.returncode == 0 and "MERGED" in (prs.stdout or "").upper():
+            return None
+        cmp_proc = subprocess.run(
+            [gh_bin, "api",
+             "repos/" + repo + "/compare/" + default_branch + "..." + branch,
+             "-q", ".status + \" \" + ((.files // []) | length | tostring)"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if cmp_proc.returncode != 0:
+            return None
+        parts = (cmp_proc.stdout or "").strip().split()
+        if len(parts) != 2:
+            return None
+        status, changed_files = parts[0], parts[1]
+        # Zadanie analityczne/badawcze konczy sie pusta galezia (sam commit
+        # startowy, zero zmienionych plikow). Nie ma czego mergowac, wiec gate
+        # nie ma prawa go blokowac.
+        if changed_files == "0":
+            return None
+        if status in ("ahead", "diverged"):
+            return branch
+    except Exception:
+        return None
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2984,6 +3077,20 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: zadanie z galezia, ktora NIE zostala zmergowana, nie jest skonczone.
+    # FIX 2026-08-13: trzy razy przebieg review zostal zapisany jako ukonczenie
+    # zadania, podczas gdy praca lezala na galezi bez PR-a — uzytkownik instalowal
+    # kolejne wersje i nie widzial obiecanych zmian. Instrukcja w SKILL.md tego
+    # nie powstrzymala, wiec sprawdzamy twardo.
+    _unmerged = _unmerged_branch_for_task(conn, task_id)
+    if _unmerged:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_unmerged_branch",
+                {"branch": _unmerged},
+            )
+        raise UnmergedBranchError(_unmerged, task_id)
 
     with write_txn(conn):
         if expected_run_id is None:
@@ -4194,6 +4301,162 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+_QUOTA_LOG_MARKERS = (
+    "usage_limit_reached",
+    "The usage limit has been reached",
+    "usage limit reached",
+    "insufficient_quota",
+    "quota exceeded",
+    "credit balance is too low",
+    "Rate limited after",
+)
+
+_QUOTA_LOG_TAIL_BYTES = 24_000
+
+# Every worker run starts by echoing its query line into the task log.
+_WORKER_RUN_BANNER = "Query: work kanban task"
+
+
+def _worker_log_dir_for_conn(conn):
+    """Directory holding per-task worker logs for *this connection's* board.
+
+    ``worker_logs_dir()`` without an explicit board falls back to
+    ``get_current_board()`` — a single global pointer that has nothing to do
+    with the board the dispatcher is currently servicing. Deriving the path
+    from the open database file keeps the lookup correct for every board.
+    """
+    try:
+        for _, name, filename in conn.execute("PRAGMA database_list"):
+            if name == "main" and filename:
+                return pathlib.Path(filename).resolve().parent / "logs"
+    except Exception:
+        pass
+    return worker_logs_dir()
+
+
+def _worker_died_on_provider_quota(task_id, board=None, conn=None):
+    """True when the worker log tail shows the model provider refused the
+    call because the account quota / usage limit is exhausted.
+
+    Such an exit is transient infrastructure, not a protocol violation: the
+    worker never got a single model response, so it could not call
+    ``kanban_complete`` / ``kanban_block``. Tripping the circuit breaker on
+    it silently loses real work (task -> blocked -> archived), so the caller
+    treats this case as a plain retryable crash instead.
+    """
+    try:
+        if conn is not None:
+            log_dir = _worker_log_dir_for_conn(conn)
+        else:
+            log_dir = worker_logs_dir(board)
+        log_path = log_dir / f"{task_id}.log"
+        if not log_path.exists():
+            return False
+        size = log_path.stat().st_size
+        with open(log_path, "rb") as fh:
+            if size > _QUOTA_LOG_TAIL_BYTES:
+                fh.seek(size - _QUOTA_LOG_TAIL_BYTES)
+            tail = fh.read().decode("utf-8", "replace")
+    except Exception:
+        return False
+    # Worker logs are appended across runs. A quota message from an EARLIER
+    # run must not excuse a genuine protocol violation in the current one, so
+    # only the text after the last run banner counts.
+    marker = tail.rfind(_WORKER_RUN_BANNER)
+    if marker != -1:
+        tail = tail[marker:]
+    return any(m in tail for m in _QUOTA_LOG_MARKERS)
+
+
+
+# FIX 2026-09-03 (Claude): worker padajacy na 429 (quota providera) byl
+# respawnowany CO TICK (t_ea2d1128 na asiacrm: 14 crashy w 14 minut, az do
+# recznej interwencji). Powod: crash quota omija _record_task_failure, wiec
+# last_failure_error jest puste i guard `blocker_auth` nigdy nie zadziala.
+# Nowe zachowanie: karta laduje w `scheduled` z zapisanym czasem wznowienia
+# (z `resets_at` w logu workera, gdy jest; inaczej domyslny backoff), a
+# dispatcher sam ja budzi po tym czasie (_wake_quota_parked).
+_QUOTA_RESETS_AT_RE = re.compile(r"[\'\"]resets_at[\'\"]\s*:\s*(\d{9,11})")
+_QUOTA_PARK_DEFAULT_SECONDS = 15 * 60
+_QUOTA_PARK_MAX_SECONDS = 6 * 3600
+_QUOTA_PARK_MARGIN_SECONDS = 90
+_QUOTA_PARK_EVENT = "quota_parked"
+
+
+def _quota_reset_epoch_from_log(task_id, conn=None):
+    """Najpozniejszy `resets_at` z ogona logu workera (tylko biezacy run)."""
+    try:
+        log_dir = _worker_log_dir_for_conn(conn) if conn is not None else worker_logs_dir()
+        log_path = log_dir / f"{task_id}.log"
+        if not log_path.exists():
+            return None
+        size = log_path.stat().st_size
+        with open(log_path, "rb") as fh:
+            if size > _QUOTA_LOG_TAIL_BYTES:
+                fh.seek(size - _QUOTA_LOG_TAIL_BYTES)
+            tail = fh.read().decode("utf-8", "replace")
+        marker = tail.rfind(_WORKER_RUN_BANNER)
+        if marker != -1:
+            tail = tail[marker:]
+        found = [int(m) for m in _QUOTA_RESETS_AT_RE.findall(tail)]
+        return max(found) if found else None
+    except Exception:
+        return None
+
+
+def _park_task_for_quota(conn, task_id):
+    """Przenies karte (ready po crashu) do `scheduled` az do resetu limitu."""
+    now = int(time.time())
+    reset_at = _quota_reset_epoch_from_log(task_id, conn=conn)
+    if reset_at and now < reset_at <= now + _QUOTA_PARK_MAX_SECONDS:
+        resume_at = reset_at + _QUOTA_PARK_MARGIN_SECONDS
+        src = "resets_at"
+    else:
+        resume_at = now + _QUOTA_PARK_DEFAULT_SECONDS
+        src = "default_backoff"
+    when = datetime.fromtimestamp(resume_at).strftime("%Y-%m-%d %H:%M")
+    reason = (
+        f"provider quota exhausted (HTTP 429) - auto-parked until {when} "
+        f"({src}); dispatcher will resume automatically"
+    )
+    try:
+        if not schedule_task(conn, task_id, reason=reason):
+            return False
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, _QUOTA_PARK_EVENT,
+                {"resume_at": resume_at, "source": src},
+            )
+        return True
+    except Exception:
+        return False
+
+
+def _wake_quota_parked(conn):
+    """Obudz karty zaparkowane przez _park_task_for_quota, ktorym minal czas."""
+    now = int(time.time())
+    woken = []
+    try:
+        rows = conn.execute(
+            "SELECT t.id AS id, e.payload AS payload FROM tasks t "
+            "JOIN task_events e ON e.task_id = t.id "
+            "WHERE t.status = 'scheduled' AND e.kind = ? "
+            "AND e.id = (SELECT MAX(id) FROM task_events WHERE task_id = t.id "
+            "            AND kind IN (?, 'scheduled', 'unblocked'))",
+            (_QUOTA_PARK_EVENT, _QUOTA_PARK_EVENT),
+        ).fetchall()
+    except Exception:
+        return woken
+    for row in rows:
+        try:
+            resume_at = int((json.loads(row["payload"] or "{}") or {}).get("resume_at") or 0)
+        except Exception:
+            continue
+        if resume_at and resume_at <= now and unblock_task(conn, row["id"]):
+            woken.append(row["id"])
+    return woken
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -4709,7 +4972,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
-            if kind == "clean_exit":
+            if kind == "clean_exit" and _worker_died_on_provider_quota(
+                row["id"], conn=conn
+            ):
+                protocol_violation = False
+                error_text = (
+                    "worker exited without a terminal transition because the "
+                    "model provider quota was exhausted (HTTP 429 / usage "
+                    "limit) - retrying after reset"
+                )
+                event_kind = "provider_quota_exhausted"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "retryable": True,
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Retrying won't
@@ -4780,6 +5059,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
+            if "model provider quota was exhausted" in error_text:
+                _park_task_for_quota(conn, tid)
+                continue
             fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation
@@ -5094,13 +5376,78 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        if not c["body"]:
+            continue
+        match = _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+        if not match:
+            continue
+        # FIX 2026-08-12: sama OBECNOSC adresu PR-a w komentarzu nie znaczy, ze
+        # praca trwa. Wczesniej kazdy zmergowany PR blokowal respawn az do konca
+        # 24-godzinnego okna — zaobserwowano zadanie odbite 1356 razy przez 22 h,
+        # przy zerowym postepie. Pytamy wiec GitHuba o stan PR-a i blokujemy
+        # wylacznie przy OPEN.
+        state = _github_pr_state(match.group(0))
+        if state == "OPEN":
+            return "active_pr"
+        if state is None and (now - int(c["created_at"])) < _RESPAWN_GUARD_PR_UNKNOWN_WINDOW:
+            # Stanu nie da sie ustalic (brak gh, brak sieci, limit API). Blokujemy
+            # tylko przez chwile po wpisie — tyle, ile trwa otwieranie PR-a —
+            # zeby awaria odczytu nie zamienila sie w ciche zawieszenie zadania.
             return "active_pr"
 
     return None
+
+
+# Okno, przez ktore blokujemy respawn, gdy stanu PR-a NIE DA SIE ustalic
+# (brak `gh`, brak sieci, limit API). Krotkie celowo: niepewnosc nie moze
+# zamieniac sie w wielogodzinne zawieszenie zadania.
+_RESPAWN_GUARD_PR_UNKNOWN_WINDOW = 900  # 15 minut
+
+_PR_STATE_TTL_SECONDS = 120
+_pr_state_cache: "dict[str, tuple[Optional[str], float]]" = {}
+
+
+def _github_pr_state(url: str) -> "Optional[str]":
+    """Stan PR-a: ``"OPEN"`` / ``"MERGED"`` / ``"CLOSED"``, albo ``None``
+    gdy nie da sie go ustalic (brak `gh`, brak sieci, blad API).
+
+    Wynik jest cache'owany na ``_PR_STATE_TTL_SECONDS``, bo dispatcher
+    odpytuje guard co tick i bez cache bilibysmy GitHuba co minute dla
+    kazdego zadania z PR-em w komentarzu.
+    """
+    now = time.time()
+    cached = _pr_state_cache.get(url)
+    if cached is not None and now - cached[1] < _PR_STATE_TTL_SECONDS:
+        return cached[0]
+    state: "Optional[str]" = None
+    gh_bin = shutil.which("gh")
+    # `gh pr view <url>` dziala tylko wewnatrz katalogu repozytorium. Dispatcher
+    # chodzi z dowolnego cwd, wiec wyciagamy owner/repo/numer z adresu i podajemy
+    # je jawnie przez --repo. Bez tego kazde zapytanie zwracalo blad, a guard
+    # wpadal w galaz "nie da sie ustalic".
+    parsed = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", url)
+    if gh_bin and parsed:
+        owner, repo, number = parsed.group(1), parsed.group(2), parsed.group(3)
+        try:
+            proc = subprocess.run(
+                [gh_bin, "pr", "view", number, "--repo", f"{owner}/{repo}",
+                 "--json", "state", "-q", ".state"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                value = (proc.stdout or "").strip().upper()
+                if value:
+                    state = value
+        except Exception:
+            state = None
+    _pr_state_cache[url] = (state, now)
+    return state
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -5248,7 +5595,8 @@ def dispatch_once(
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn)
+    _woken = _wake_quota_parked(conn)
+    result.promoted = recompute_ready(conn) + len(_woken)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
