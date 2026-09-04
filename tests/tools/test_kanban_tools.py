@@ -561,7 +561,7 @@ def test_kanban_guidance_prompt_size_bounded():
     """
     from agent.prompt_builder import KANBAN_GUIDANCE
 
-    assert len(KANBAN_GUIDANCE) < 8000, (
+    assert len(KANBAN_GUIDANCE) < 11000, (  # local-patches: +auto-merge, WORKER-RULES, checkpoint-commit
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
         "every kanban worker's system prompt — trim it or consciously re-bound "
         "this invariant with justification."
