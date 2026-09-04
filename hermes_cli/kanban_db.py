@@ -5360,6 +5360,98 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class UnmergedBranchError(RuntimeError):
+    """Zamkniecie zadania odrzucone: galaz zadania nie jest w galezi domyslnej."""
+
+    def __init__(self, branch: str, task_id: str):
+        self.branch = branch
+        self.task_id = task_id
+        super().__init__(
+            f"Nie moge zamknac {task_id}: galaz '{branch}' nie zostala zmergowana "
+            f"do galezi domyslnej. Ukonczone review NIE jest ukonczonym zadaniem — "
+            f"otworz PR, doprowadz build do zieleni, zmerguj i dopiero wtedy zamykaj."
+        )
+
+
+def _unmerged_branch_for_task(conn, task_id):
+    """Nazwa galezi, jesli da sie POZYTYWNIE stwierdzic, ze wyprzedza galaz
+    domyslna (praca nie zostala zmergowana). Przy jakiejkolwiek niepewnosci
+    zwraca None — gate ma lapac realny blad, a nie zatrzymywac prace.
+    """
+    row = conn.execute(
+        "SELECT branch_name, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    branch = (row["branch_name"] or "").strip()
+    workspace = (row["workspace_path"] or "").strip()
+    if not branch or not workspace or not os.path.isdir(workspace):
+        return None
+    git_bin = shutil.which("git")
+    gh_bin = shutil.which("gh")
+    if not git_bin or not gh_bin:
+        return None
+    try:
+        remote = subprocess.run(
+            [git_bin, "-C", workspace, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if remote.returncode != 0:
+            return None
+        slug = re.search(
+            r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$",
+            (remote.stdout or "").strip(),
+        )
+        if not slug:
+            return None
+        repo = slug.group(1) + "/" + slug.group(2)
+        base = subprocess.run(
+            [gh_bin, "repo", "view", repo, "--json", "defaultBranchRef",
+             "-q", ".defaultBranchRef.name"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if base.returncode != 0:
+            return None
+        default_branch = (base.stdout or "").strip()
+        if not default_branch or default_branch == branch:
+            return None
+        # SQUASH MERGE: po scaleniu przez squash commity galezi NIE staja sie
+        # przodkami main, wiec `compare` nadal raportuje "ahead"/"diverged".
+        # Dlatego najpierw pytamy o PR-y z tej galezi — zmergowany PR jest
+        # rozstrzygajacym dowodem, ze praca weszla.
+        prs = subprocess.run(
+            [gh_bin, "pr", "list", "--repo", repo, "--head", branch,
+             "--state", "all", "--limit", "20", "--json", "state",
+             "-q", "[.[].state] | join(\",\")"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if prs.returncode == 0 and "MERGED" in (prs.stdout or "").upper():
+            return None
+        cmp_proc = subprocess.run(
+            [gh_bin, "api",
+             "repos/" + repo + "/compare/" + default_branch + "..." + branch,
+             "-q", ".status + \" \" + ((.files // []) | length | tostring)"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if cmp_proc.returncode != 0:
+            return None
+        parts = (cmp_proc.stdout or "").strip().split()
+        if len(parts) != 2:
+            return None
+        status, changed_files = parts[0], parts[1]
+        # Zadanie analityczne/badawcze konczy sie pusta galezia (sam commit
+        # startowy, zero zmienionych plikow). Nie ma czego mergowac, wiec gate
+        # nie ma prawa go blokowac.
+        if changed_files == "0":
+            return None
+        if status in ("ahead", "diverged"):
+            return branch
+    except Exception:
+        return None
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5439,6 +5531,19 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    # local-patches (U2, 2026-08-13): zadanie z galezia, ktora NIE zostala
+    # zmergowana, nie jest skonczone. Trzy razy przebieg review zostal zapisany
+    # jako ukonczenie zadania, podczas gdy praca lezala na galezi bez PR-a.
+    _unmerged = _unmerged_branch_for_task(conn, task_id)
+    if _unmerged:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_unmerged_branch",
+                {"branch": _unmerged},
+            )
+        raise UnmergedBranchError(_unmerged, task_id)
+
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -9539,13 +9644,73 @@ def check_respawn_guard(
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        if not c["body"]:
+            continue
+        match = _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+        if not match:
+            continue
+        # local-patches (U4, 2026-08-12): sama OBECNOSC adresu PR-a w komentarzu
+        # nie znaczy, ze praca trwa (zadanie odbite 1356 razy przez 22 h).
+        # Pytamy GitHuba o stan PR-a i blokujemy wylacznie przy OPEN.
+        state = _github_pr_state(match.group(0))
+        if state == "OPEN":
+            return "active_pr"
+        if state is None and (now - int(c["created_at"])) < _RESPAWN_GUARD_PR_UNKNOWN_WINDOW:
             return "active_pr"
 
     return None
+
+
+# Okno, przez ktore blokujemy respawn, gdy stanu PR-a NIE DA SIE ustalic
+# (brak `gh`, brak sieci, limit API). Krotkie celowo: niepewnosc nie moze
+# zamieniac sie w wielogodzinne zawieszenie zadania.
+_RESPAWN_GUARD_PR_UNKNOWN_WINDOW = 900  # 15 minut
+
+_PR_STATE_TTL_SECONDS = 120
+_pr_state_cache: "dict[str, tuple[Optional[str], float]]" = {}
+
+
+def _github_pr_state(url: str) -> "Optional[str]":
+    """Stan PR-a: ``"OPEN"`` / ``"MERGED"`` / ``"CLOSED"``, albo ``None``
+    gdy nie da sie go ustalic (brak `gh`, brak sieci, blad API).
+
+    Wynik jest cache'owany na ``_PR_STATE_TTL_SECONDS``, bo dispatcher
+    odpytuje guard co tick i bez cache bilibysmy GitHuba co minute dla
+    kazdego zadania z PR-em w komentarzu.
+    """
+    now = time.time()
+    cached = _pr_state_cache.get(url)
+    if cached is not None and now - cached[1] < _PR_STATE_TTL_SECONDS:
+        return cached[0]
+    state: "Optional[str]" = None
+    gh_bin = shutil.which("gh")
+    # `gh pr view <url>` dziala tylko wewnatrz katalogu repozytorium. Dispatcher
+    # chodzi z dowolnego cwd, wiec wyciagamy owner/repo/numer z adresu i podajemy
+    # je jawnie przez --repo. Bez tego kazde zapytanie zwracalo blad, a guard
+    # wpadal w galaz "nie da sie ustalic".
+    parsed = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", url)
+    if gh_bin and parsed:
+        owner, repo, number = parsed.group(1), parsed.group(2), parsed.group(3)
+        try:
+            proc = subprocess.run(
+                [gh_bin, "pr", "view", number, "--repo", f"{owner}/{repo}",
+                 "--json", "state", "-q", ".state"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                value = (proc.stdout or "").strip().upper()
+                if value:
+                    state = value
+        except Exception:
+            state = None
+    _pr_state_cache[url] = (state, now)
+    return state
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:

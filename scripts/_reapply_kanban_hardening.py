@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Idempotent hardening patches for Hermes kanban (2026-07-23).
+"""Idempotent hardening patches for Hermes kanban (2026-07-23; adapted for 0.21 on 2026-09-04).
 
 fix7a: hermes_state.py - remove "disk i/o error" from _WAL_INCOMPAT_MARKERS.
        Transient SQLITE_IOERR on a local FS triggered WAL->DELETE journal-mode
@@ -12,11 +12,12 @@ fix7c: kanban_db.py - SKILL-SYNC (per-task skills auto-copied to the worker's
 
 Exit 0 = all applied (or already present). Exit 1 = anchor missing.
 """
+import os
 import re
 import sys
 from pathlib import Path
 
-AGENT = Path("/home/tomek/.hermes/hermes-agent")
+AGENT = Path(os.environ.get("HERMES_AGENT_DIR") or Path(__file__).resolve().parents[1])
 STATE = AGENT / "hermes_state.py"
 KDB = AGENT / "hermes_cli" / "kanban_db.py"
 rc = 0
@@ -43,6 +44,13 @@ except ValueError:
 # komentarza. Upstream może zachować poprawkę bez komentarza po rebase/update.
 if marker_block and not re.search(r"(?i)[\"']disk i/o error[\"']", marker_block):
     report("fix7a", "already-applied")
+elif marker_block and "Disambiguate by retrying the pragma" in s and "another process already set WAL on disk" in s:
+    # Upstream >= 0.21 ("Bug D" fix): a disk i/o error on PRAGMA journal_mode=WAL
+    # is retried (transient EIO clears -> stays WAL) and the DELETE fallback is
+    # refused when the on-disk journal mode is already WAL or cannot be verified.
+    # That covers the 2026-05/07 local-FS incidents without removing the marker,
+    # so the ZFS/APFS deterministic case keeps its fallback. Nothing to apply.
+    report("fix7a", "superseded-by-upstream (EIO retry + on-disk WAL guard)")
 elif marker_block:
     updated_block, replacements = re.subn(
         r"(?m)^[ \t]*[\"']disk i/o error[\"'][^\n]*\n",
@@ -85,6 +93,11 @@ NEW_B = '''    base_name = resolved.name  # basename only
 '''
 if "HARDENING 2026-07-23 (fix7b)" in k:
     report("fix7b", "already-applied")
+elif "def _backup_corrupt_db" in k and "hashlib.sha256()" in k.split("def _backup_corrupt_db", 1)[1][:4000]:
+    # Upstream >= 0.21 deduplicates corrupt snapshots by content hash (same
+    # corrupt bytes -> one backup), which solves the 3728-files incident
+    # differently. Nothing to apply.
+    report("fix7b", "superseded-by-upstream (content-hash dedup)")
 elif k.count(OLD_B) == 1:
     k = k.replace(OLD_B, NEW_B, 1)
     KDB.write_text(k, encoding="utf-8")
@@ -94,8 +107,15 @@ else:
 
 # ---------- fix7c: SKILL-SYNC (re-apply after hermes update) ----------
 k = KDB.read_text(encoding="utf-8")
+CLI = AGENT / "cli.py"
+_cli = CLI.read_text(encoding="utf-8") if CLI.exists() else ""
 if "SKILL-SYNC PATCH" in k:
     report("fix7c", "already-applied")
+elif "Unknown skill(s) requested, skipping" in _cli:
+    # Upstream >= 0.21: an unknown per-task skill is skipped with a warning
+    # as long as at least one requested skill loads (kanban-worker always
+    # does), so the worker no longer crash-loops on a typo'd skill name.
+    report("fix7c", "superseded-by-upstream (graceful unknown-skill skip)")
 else:
     HELPER = '''
 # SKILL-SYNC PATCH (2026-07-23, fix7c): per-task skills were passed blindly to
