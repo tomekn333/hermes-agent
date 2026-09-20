@@ -11315,6 +11315,24 @@ _CODEX_ACTIVE_ACCOUNT_FILE = "/home/tomek/.usage-dashboard/codex_active_account"
 
 
 def _active_codex_account_for_runtime():
+    """Konto Codex uzywane RUNTIME. Deleguje do engine_avail (jedno zrodlo prawdy).
+
+    Review 2026-09-20 (finding #1): warunek zgodnosci konta zyje teraz w
+    ``engine_avail.work_acc_ok()``, wiec router POMIJA niezgodne konto zamiast
+    zwracac je do odrzucenia przy spawnie. Tutejsze sprawdzenie zostaje jako
+    ostatnia bariera na wyscig (plik moze sie zmienic miedzy decyzja routera
+    a spawnem). Lokalny odczyt pliku jest fallbackiem, gdy modul niedostepny.
+    """
+    try:
+        import sys as _sys
+        if _WORK_ROUTER_MODULE_DIR not in _sys.path:
+            _sys.path.insert(0, _WORK_ROUTER_MODULE_DIR)
+        import engine_avail as _ea
+        _fn = getattr(_ea, "active_codex_account_for_runtime", None)
+        if _fn is not None:
+            return _fn()
+    except Exception:
+        pass
     try:
         with open(_CODEX_ACTIVE_ACCOUNT_FILE, encoding="utf-8") as fh:
             return fh.read().strip() or None
