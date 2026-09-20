@@ -74,6 +74,7 @@ import contextlib
 import hashlib
 import json
 import os
+import pathlib
 import re
 import random
 import secrets
@@ -8236,6 +8237,79 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+_QUOTA_LOG_MARKERS = (
+    "usage_limit_reached",
+    "The usage limit has been reached",
+    "usage limit reached",
+    "insufficient_quota",
+    "quota exceeded",
+    "credit balance is too low",
+    "Rate limited after",
+    # Retry waits happen only after a rate limit; a worker interrupted during
+    # one died waiting for quota, not because it misbehaved.
+    "Interrupt detected during retry wait",
+)
+
+_QUOTA_LOG_TAIL_BYTES = 24_000
+
+# Every worker run echoes its query line into the task log.
+_WORKER_RUN_BANNER = "Query: work kanban task"
+
+
+def _worker_log_dir_for_conn(conn):
+    """Directory holding per-task worker logs for *this connection's* board.
+
+    ``worker_logs_dir()`` without an explicit board falls back to
+    ``get_current_board()`` - a single global pointer unrelated to the board
+    the dispatcher is servicing. Deriving the path from the open database
+    file keeps the lookup correct for every board.
+    """
+    try:
+        for _, name, filename in conn.execute("PRAGMA database_list"):
+            if name == "main" and filename:
+                return pathlib.Path(filename).resolve().parent / "logs"
+    except Exception:
+        pass
+    return worker_logs_dir()
+
+
+def _worker_died_on_provider_quota(task_id, board=None, conn=None):
+    """True when the worker log shows the model provider refused the call
+    because the account quota / usage limit is exhausted.
+
+    Safety net behind the EX_TEMPFAIL sentinel: a worker that dies on a
+    quota wall but still exits 0 (e.g. interrupted during a retry wait)
+    would otherwise be classified as a protocol violation and lose real
+    work through the circuit breaker.
+    """
+    try:
+        if conn is not None:
+            log_dir = _worker_log_dir_for_conn(conn)
+        else:
+            log_dir = worker_logs_dir(board)
+        log_path = log_dir / f"{task_id}.log"
+        if not log_path.exists():
+            return False
+        size = log_path.stat().st_size
+        with open(log_path, "rb") as fh:
+            if size > _QUOTA_LOG_TAIL_BYTES:
+                fh.seek(size - _QUOTA_LOG_TAIL_BYTES)
+            tail = fh.read().decode("utf-8", "replace")
+    except Exception:
+        return False
+    # Logs are appended across runs; a quota message from an EARLIER run must
+    # not excuse a genuine protocol violation now. Only the text after the
+    # last run banner counts - unless that segment is a bare startup stub
+    # (the run died before printing anything), in which case the previous
+    # run's tail is the only evidence there is.
+    marker = tail.rfind(_WORKER_RUN_BANNER)
+    if marker != -1:
+        current = tail[marker:]
+        if len(current) > 1_500 or any(m in current for m in _QUOTA_LOG_MARKERS):
+            tail = current
+    return any(m in tail for m in _QUOTA_LOG_MARKERS)
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -9032,6 +9106,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            if kind in ("clean_exit", "unknown") and _worker_died_on_provider_quota(
+                row["id"], conn=conn
+            ):
+                # The worker died on a quota wall but exited 0 instead of the
+                # EX_TEMPFAIL sentinel (seen in production 2026-09-06:
+                # "Interrupt detected during retry wait" after HTTP 429).
+                # The log is unambiguous - treat it exactly like the sentinel.
+                # ``unknown`` (pid missing from the reap registry) is covered
+                # too: in a quota storm workers die within seconds and the
+                # registry does not always see them.
+                kind = "rate_limited"
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -11105,6 +11190,32 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
+    else:
+        # WORK-ROUTER (Tomek 2026-09-20, watek 1789925693.553569).
+        # Dotyczy WYLACZNIE spawnu workerow; polityka czatu (config.yaml
+        # model/provider/fallback_providers/delegation) NIE jest ruszana.
+        # Kolejnosc: Claude Max -> Codex acc2 (rezerwa 15%) -> Codex acc1 (50%).
+        # Zrodlo decyzji: ~/.hermes/engine_avail.pick_work_engine().
+        # Jawny model_override z karty ma pierwszenstwo (galaz wyzej) - operator
+        # moze przypiac silnik recznie.
+        # Poprzedni patch tej sciezki byl w 0.14 (_default_spawn, CC-ROUTER) i
+        # NIE przeniosl sie na 0.21 - stad ta wersja.
+        _wr = _pick_work_engine_for_spawn()
+        if _wr is None:
+            # Zaden dozwolony silnik flat nie jest dostepny. NIE spawnujemy na
+            # slepo i NIE schodzimy na platny fallback: RuntimeError konczy sie
+            # spawn-failure -> task wraca do kolejki, a tier-gate go parkuje.
+            raise RuntimeError(
+                "work-router: brak dostepnego silnika flat "
+                "(Claude Max / Codex acc2>15% / Codex acc1>50%) — parkuje zamiast spawnowac"
+            )
+        if _wr.get("engine") == "claude-max":
+            cmd.extend(["-m", _wr["model"], "--provider", _wr["provider"]])
+        elif _wr.get("engine") == "codex":
+            # CODEX_HOME per subprocess — NIE przepinamy globalnego konta czatu
+            # (~/.codex ani codex_active_account zostaja nietkniete).
+            env["CODEX_HOME"] = _wr["codex_home"]
+        _record_work_router_choice(board, task.id, _wr)
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.
@@ -11165,6 +11276,56 @@ def _default_spawn(
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
     return proc.pid
+
+
+_WORK_ROUTER_MODULE_DIR = "/home/tomek/.hermes"
+
+
+def _pick_work_engine_for_spawn():
+    """Silnik dla spawnu workera wg polityki PRACY (Tomek 2026-09-20).
+
+    Deleguje do ``~/.hermes/engine_avail.pick_work_engine()``: Claude Max ->
+    Codex acc2 (rezerwa 15%) -> Codex acc1 (rezerwa 50%). Zwraca ``None``
+    gdy zaden dozwolony silnik flat nie jest dostepny — wtedy wolajacy
+    NIE spawnuje (jawne parkowanie zamiast crash-loopu).
+
+    Gdy modul jest niedostepny (inna maszyna, swiezy checkout) zwracamy
+    sentinel ``{"engine": "profile-default"}``, ktory zostawia dotychczasowe
+    zachowanie dispatchera nietkniete — brak lokalnego modulu nie moze
+    zablokowac calej tablicy.
+    """
+    import sys as _sys
+    if _WORK_ROUTER_MODULE_DIR not in _sys.path:
+        _sys.path.insert(0, _WORK_ROUTER_MODULE_DIR)
+    try:
+        import engine_avail as _ea
+    except Exception:
+        return {"engine": "profile-default"}
+    try:
+        return _ea.pick_work_engine()
+    except Exception:
+        # Blad wewnatrz routera nie moze zatrzymac tablicy — spadamy na
+        # dotychczasowe zachowanie (model/provider profilu workera).
+        return {"engine": "profile-default"}
+
+
+def _record_work_router_choice(board, task_id, choice):
+    """Bezsekretowy sidecar z wyborem silnika dla TEGO spawnu.
+
+    Pisze ``<board-root>/logs/<task>.engine.json`` — czyta go weryfikacja E2E
+    i (docelowo) dashboard. Nigdy nie przerywa spawnu.
+    """
+    try:
+        log_dir = worker_logs_dir(board=board)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        payload = dict(choice or {})
+        payload["task_id"] = task_id
+        payload["recorded_at"] = int(time.time())
+        (log_dir / f"{task_id}.engine.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
