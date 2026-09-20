@@ -11211,11 +11211,39 @@ def _default_spawn(
             )
         if _wr.get("engine") == "claude-max":
             cmd.extend(["-m", _wr["model"], "--provider", _wr["provider"]])
+            _record_work_router_choice(board, task.id, _wr,
+                                       actual={"provider": _wr["provider"],
+                                               "model": _wr["model"]})
         elif _wr.get("engine") == "codex":
             # CODEX_HOME per subprocess — NIE przepinamy globalnego konta czatu
             # (~/.codex ani codex_active_account zostaja nietkniete).
             env["CODEX_HOME"] = _wr["codex_home"]
-        _record_work_router_choice(board, task.id, _wr)
+            # Przypnij providera, zeby profil workera nie mogl po cichu
+            # uniewaznic decyzji routera innym modelem/backendem (review H3).
+            cmd.extend(["--provider", "openai-codex"])
+            # C2 (review 2026-09-20): w trybie `codex_responses` poswiadczenia
+            # bierze hermesowy auth store (source=hermes-auth-store), a NIE
+            # CODEX_HOME — zweryfikowane empirycznie. Crony mirroruja do niego
+            # token konta AKTYWNEGO. Gdyby router wybral inne konto niz aktywne,
+            # worker realnie spalilby kwote nie tego konta, obchodzac rezerwe.
+            # Dopoki tozsamosc konta nie jest egzekwowalna per subprocess,
+            # PARKUJEMY zamiast palic cudza rezerwe.
+            _active = _active_codex_account_for_runtime()
+            if _active and _active != _wr.get("account"):
+                raise RuntimeError(
+                    "work-router: wybrano Codex %s, ale runtime uzywa konta %s "
+                    "(auth store, api_mode=codex_responses) — parkuje, zeby nie "
+                    "spalic rezerwy niewlasciwego konta"
+                    % (_wr.get("account"), _active)
+                )
+            _record_work_router_choice(
+                board, task.id, _wr,
+                actual={"provider": "openai-codex",
+                        "codex_account_runtime": _active,
+                        "credential_source": "hermes-auth-store"},
+            )
+        else:
+            _record_work_router_choice(board, task.id, _wr)
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.
@@ -11279,6 +11307,19 @@ def _default_spawn(
 
 
 _WORK_ROUTER_MODULE_DIR = "/home/tomek/.hermes"
+# Plik-prawda o koncie Codex uzywanym RUNTIME. Crony (`sync_active_codex_auth.py`,
+# `sync_codex_auth_to_gateway.sh`) mirroruja token WLASNIE tego konta do
+# ~/.codex i dalej do ~/.hermes/auth.json, skad bierze je provider
+# `openai-codex` w trybie `codex_responses`.
+_CODEX_ACTIVE_ACCOUNT_FILE = "/home/tomek/.usage-dashboard/codex_active_account"
+
+
+def _active_codex_account_for_runtime():
+    try:
+        with open(_CODEX_ACTIVE_ACCOUNT_FILE, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except Exception:
+        return None
 
 
 def _pick_work_engine_for_spawn():
@@ -11289,31 +11330,36 @@ def _pick_work_engine_for_spawn():
     gdy zaden dozwolony silnik flat nie jest dostepny — wtedy wolajacy
     NIE spawnuje (jawne parkowanie zamiast crash-loopu).
 
-    Gdy modul jest niedostepny (inna maszyna, swiezy checkout) zwracamy
-    sentinel ``{"engine": "profile-default"}``, ktory zostawia dotychczasowe
-    zachowanie dispatchera nietkniete — brak lokalnego modulu nie moze
-    zablokowac calej tablicy.
+    FAIL-CLOSED (review 2026-09-20, finding H2): tylko brak samego modulu
+    (``ModuleNotFoundError`` przy nieistniejacym katalogu) daje sentinel
+    ``{"engine": "profile-default"}``, ktory zostawia dotychczasowe zachowanie
+    dispatchera. KAZDY inny blad — uszkodzony modul, ``AttributeError`` po
+    przywroceniu starego backupu, wyjatek w srodku polityki — jest logowany
+    i propagowany, bo cichy powrot na profil domyslny omijalby OBIE rezerwy.
     """
     import sys as _sys
     if _WORK_ROUTER_MODULE_DIR not in _sys.path:
         _sys.path.insert(0, _WORK_ROUTER_MODULE_DIR)
     try:
         import engine_avail as _ea
-    except Exception:
+    except ModuleNotFoundError:
+        if os.path.isdir(_WORK_ROUTER_MODULE_DIR) and os.path.exists(
+            os.path.join(_WORK_ROUTER_MODULE_DIR, "engine_avail.py")
+        ):
+            # Modul JEST na dysku, a mimo to sie nie zaimportowal — to blad,
+            # nie "inna maszyna". Nie wolno cicho ominac rezerw.
+            raise
         return {"engine": "profile-default"}
-    try:
-        return _ea.pick_work_engine()
-    except Exception:
-        # Blad wewnatrz routera nie moze zatrzymac tablicy — spadamy na
-        # dotychczasowe zachowanie (model/provider profilu workera).
-        return {"engine": "profile-default"}
+    return _ea.pick_work_engine()
 
 
-def _record_work_router_choice(board, task_id, choice):
+def _record_work_router_choice(board, task_id, choice, actual=None):
     """Bezsekretowy sidecar z wyborem silnika dla TEGO spawnu.
 
     Pisze ``<board-root>/logs/<task>.engine.json`` — czyta go weryfikacja E2E
-    i (docelowo) dashboard. Nigdy nie przerywa spawnu.
+    i dashboard. ``actual`` niesie FAKTYCZNIE uzyte zrodlo (np. konto Codex
+    wynikajace z auth store), zeby sidecar byl dowodem, a nie deklaracja.
+    Nigdy nie przerywa spawnu.
     """
     try:
         log_dir = worker_logs_dir(board=board)
@@ -11321,6 +11367,8 @@ def _record_work_router_choice(board, task_id, choice):
         payload = dict(choice or {})
         payload["task_id"] = task_id
         payload["recorded_at"] = int(time.time())
+        if actual:
+            payload["actual"] = actual
         (log_dir / f"{task_id}.engine.json").write_text(
             json.dumps(payload, indent=2), encoding="utf-8"
         )
