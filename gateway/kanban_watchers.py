@@ -980,11 +980,14 @@ class GatewayKanbanWatchersMixin:
                             # after a quiet stretch. The text is frozen in the
                             # payload at write time so a later wording change
                             # cannot rewrite what the user was already told.
-                            if task and task.status in ("done", "archived"):
-                                # The task finished between the write and this
-                                # tick. A "work continues" line after the DONE
-                                # message is worse than silence; the event is
-                                # still claimed so the cursor moves past it.
+                            if task is None or task.status != "running":
+                                # The task left the running phase between the
+                                # write and this tick (done, blocked, archived,
+                                # reclaimed, or the row is gone). A "work
+                                # continues" line after the DONE/BLOCKED
+                                # message contradicts what the user was just
+                                # told, so drop it — the event is still
+                                # claimed, so the cursor moves past it.
                                 continue
                             from gateway.kanban_progress import (
                                 format_event_for_delivery,

@@ -73,6 +73,30 @@ _VALID_STATES = (
 NO_STAGE_TEXT = "brak zadeklarowanego etapu"
 
 
+def _as_bool(value: Any, fallback: bool) -> bool:
+    """Parse a YAML-ish truth value without the ``bool("false") is True`` trap.
+
+    A quoted ``"false"`` in config.yaml is a plain non-empty string, and
+    ``bool()`` on it is ``True`` — the exact shape that once left an
+    automatic session reset switched on after the owner had disabled it.
+    Anything unrecognised falls back to *fallback* rather than guessing.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().strip("\"'").lower()
+        if text in ("true", "yes", "on", "1"):
+            return True
+        if text in ("false", "no", "off", "0", ""):
+            return False
+        return fallback
+    if value is None:
+        return False
+    return fallback
+
+
 @dataclass(frozen=True)
 class ProgressSettings:
     """Live knobs, read from ``kanban.progress_reports`` in config.yaml."""
@@ -115,7 +139,7 @@ class ProgressSettings:
             return max(minimum, value)
 
         return ProgressSettings(
-            enabled=bool(section.get("enabled", d.enabled)),
+            enabled=_as_bool(section.get("enabled", d.enabled), d.enabled),
             interval_seconds=_int("interval_seconds", d.interval_seconds, 5),
             silence_minutes=_int("silence_minutes", d.silence_minutes, 1),
             min_interval_seconds=_int(
@@ -342,6 +366,9 @@ class ProgressDecision:
     payload: Optional[dict] = None
     baseline_sha: Optional[str] = None
     reason: str = ""
+    #: Run this decision belongs to. Stamped onto the written event so the
+    #: cursor is scoped to the attempt that produced it.
+    run_id: Optional[int] = None
 
 
 def _last_progress_row(events: Iterable, run_id: Optional[int]) -> Optional[Any]:
@@ -404,7 +431,10 @@ def decide_for_task(
         if current_head is None:
             return ProgressDecision("skip", reason="no-repo")
         return ProgressDecision(
-            "baseline", baseline_sha=current_head, reason="first-observation"
+            "baseline",
+            baseline_sha=current_head,
+            reason="first-observation",
+            run_id=run_id,
         )
 
     stage = declared_stage(
@@ -477,7 +507,14 @@ def apply_decision(conn: Any, task_id: str, decision: ProgressDecision, kb: Any)
                 task_id,
                 BASELINE_EVENT,
                 {"head_sha": decision.baseline_sha},
-                run_id=None,
+                # Stamped with the run it baselines. A NULL run_id would
+                # survive the per-run filter in `_last_progress_row`, so a
+                # task re-claimed after a crash/timeout would treat the OLD
+                # run's baseline as its cursor and replay every commit made
+                # since — exactly the history replay this module forbids.
+                run_id=(
+                    int(decision.run_id) if decision.run_id is not None else None
+                ),
             )
             return True
         payload = dict(decision.payload or {})

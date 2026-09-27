@@ -764,3 +764,121 @@ def test_transient_send_failure_rewinds_and_retries_next_tick(
     assert len(healthy.sent) == 1
     assert "commit pod 429" in healthy.sent[0]["text"]
 
+
+
+# --- regressions from the independent review (FAIL round 1) ----------------
+
+
+def test_retry_run_does_not_replay_the_previous_runs_commits(repo):
+    """HIGH: a baseline stamped run_id=None survived the per-run filter.
+
+    A task re-claimed after crash/timeout got a NEW current_run_id. The old
+    run's `progress` rows were filtered out, but its NULL-run baseline was
+    not — so the new run treated it as its cursor and replayed every commit
+    made in the meantime.
+    """
+    now = int(time.time())
+    base = head_sha(str(repo))
+    _commit(repo, "praca poprzedniego runu 1")
+    _commit(repo, "praca poprzedniego runu 2")
+
+    # Run 1 baselined and reported; then the worker crashed.
+    events = [
+        _event(BASELINE_EVENT, {"head_sha": base}, created_at=now - 3600, run_id=1),
+        _event(
+            PROGRESS_EVENT,
+            {"head_sha": head_sha(str(repo)), "state": STATE_WORKING},
+            created_at=now - 3000,
+            run_id=1,
+        ),
+    ]
+    # Run 2 picks the task up. It must re-baseline, NOT replay run 1's work.
+    d = decide_for_task(
+        task=_task(workspace_path=str(repo), current_run_id=2),
+        events=events,
+        settings=ProgressSettings(),
+        now=now,
+    )
+    assert d.action == "baseline"
+    assert d.run_id == 2
+
+
+def test_baseline_event_is_stamped_with_its_run(repo):
+    """The written cursor row must carry the run it baselines."""
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_progress import ProgressDecision
+
+    written = {}
+
+    class _FakeTxn:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *a):
+            return False
+
+    fake_kb = types.SimpleNamespace(
+        write_txn=lambda conn: _FakeTxn(),
+        _append_event=lambda conn, tid, kind, payload, run_id=None: written.update(
+            kind=kind, run_id=run_id
+        ),
+    )
+    apply_decision(
+        None,
+        "t_x",
+        ProgressDecision("baseline", baseline_sha="abc", run_id=7),
+        fake_kb,
+    )
+    assert written == {"kind": BASELINE_EVENT, "run_id": 7}
+
+
+@pytest.mark.parametrize("raw", ["false", "no", "off", "0", '"false"', "FALSE"])
+def test_quoted_false_in_config_actually_disables_reports(raw):
+    """HIGH: bool("false") is True — the session_reset.mode trap, again.
+
+    A user who writes `enabled: "false"` (quoted, as YAML often ends up)
+    must get the feature OFF, not silently ON.
+    """
+    s = ProgressSettings.from_config(
+        {"kanban": {"progress_reports": {"enabled": raw}}}
+    )
+    assert s.enabled is False
+
+
+@pytest.mark.parametrize("raw", ["true", "yes", "on", "1", True])
+def test_truthy_config_values_enable_reports(raw):
+    s = ProgressSettings.from_config(
+        {"kanban": {"progress_reports": {"enabled": raw}}}
+    )
+    assert s.enabled is True
+
+
+def test_unrecognised_enabled_value_falls_back_to_the_default():
+    s = ProgressSettings.from_config(
+        {"kanban": {"progress_reports": {"enabled": "maybe"}}}
+    )
+    assert s.enabled is ProgressSettings().enabled
+
+
+def test_progress_is_not_delivered_after_the_task_is_blocked(
+    tmp_path, monkeypatch, repo
+):
+    """A progress row written just before a BLOCK must not contradict it."""
+    import asyncio
+
+    kb, conn, tid = _live_board(tmp_path, monkeypatch, "progress-blocked.db", repo)
+    settings = ProgressSettings(min_interval_seconds=0)
+    try:
+        scan_board(conn, kb=kb, settings=settings)
+        _commit(repo, "zmiana przed blokada")
+        assert scan_board(conn, kb=kb, settings=settings)["reported"] == 1
+        kb.block_task(conn, tid, reason="brak dostepu")
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    texts = [s["text"] for s in adapter.sent]
+    assert not any("Praca trwa." in t for t in texts)
+    assert any("blocked" in t for t in texts)
