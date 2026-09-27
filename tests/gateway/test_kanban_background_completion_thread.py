@@ -54,9 +54,29 @@ def test_background_completion_source_keeps_the_origin_thread():
         "type": "background_process",
     }
     source = runner._build_process_event_source(evt)
-    assert source is origin
+    assert source is not None
+    # The anchor, not object identity — a future refactor may legitimately
+    # return an equivalent copy of the persisted origin.
     assert source.thread_id == ORIGIN_THREAD
     assert source.chat_id == "C_ORIGIN"
+    assert source.platform == Platform.SLACK
+
+
+def test_background_completion_does_not_fall_back_to_a_foreign_thread():
+    """An unknown session must not borrow another session's origin thread.
+
+    Borrowing is how cross-topic bleed happens: the report would land in a
+    thread that belongs to someone else's request.
+    """
+    runner = _runner_with_origin(_slack_thread_origin())
+    runner._get_cached_session_source = lambda session_key: None
+    evt = {
+        "session_key": "agent:main:slack:group:C_OTHER:U9",
+        "type": "background_process",
+    }
+    source = runner._build_process_event_source(evt)
+    # Either unresolvable, or resolved WITHOUT the other session's thread.
+    assert source is None or source.thread_id != ORIGIN_THREAD
 
 
 def test_background_completion_metadata_carries_thread_ts():

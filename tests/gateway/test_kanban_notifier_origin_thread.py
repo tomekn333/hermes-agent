@@ -82,8 +82,51 @@ def _unseen(tid, chat_id, thread_id=""):
 # --- unit level: the gate predicate itself --------------------------------
 
 
-def test_slack_is_thread_only_by_default():
+def test_slack_is_thread_only_by_default(monkeypatch):
+    """Slack is thread-only with no operator config at all.
+
+    Explicitly clears the cache and points ``load_config`` at an empty dict so
+    the assertion is about the shipped default, not whatever the host's
+    config.yaml happens to contain.
+    """
+    import gateway.kanban_watchers as kw
+    import hermes_cli.config as hc
+
+    monkeypatch.setattr(kw, "_thread_only_cache", None)
+    monkeypatch.setattr(hc, "load_config", lambda: {})
     assert "slack" in _thread_only_platforms()
+
+
+def test_operator_can_empty_the_thread_only_set(monkeypatch):
+    """An operator opting out via config.yaml disables the gate."""
+    import gateway.kanban_watchers as kw
+    import hermes_cli.config as hc
+
+    monkeypatch.setattr(kw, "_thread_only_cache", None)
+    monkeypatch.setattr(hc, "load_config", lambda: {"kanban": {"thread_only_platforms": []}})
+    assert _thread_only_platforms() == frozenset()
+    monkeypatch.setattr(kw, "_thread_only_cache", None)
+
+
+def test_unreadable_config_fails_safe_to_thread_only(monkeypatch):
+    """A config read error must not re-enable top-level posting."""
+    import gateway.kanban_watchers as kw
+    import hermes_cli.config as hc
+
+    def boom():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(kw, "_thread_only_cache", None)
+    monkeypatch.setattr(hc, "load_config", boom)
+    assert "slack" in _thread_only_platforms()
+    monkeypatch.setattr(kw, "_thread_only_cache", None)
+
+
+def test_shipped_default_declares_slack_thread_only():
+    """The behaviour above is backed by a real, discoverable config key."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert "slack" in DEFAULT_CONFIG["kanban"]["thread_only_platforms"]
 
 
 def test_gate_fires_only_without_an_anchor_on_a_thread_only_platform():
@@ -200,6 +243,82 @@ def test_report_is_withheld_when_no_origin_thread_was_recorded(
     # ...and the report is still pending, so it can be delivered once the
     # mapping is repaired. This is the "nie gubic raportow" requirement.
     assert len(_unseen(tid, "C_ORIGIN")) == 1
+
+
+def test_withheld_report_survives_many_ticks(tmp_path, monkeypatch):
+    """Repeated ticks must not consume, drop, or churn the withheld event.
+
+    The gate skips BEFORE claiming, so there is no claim/rewind cycle whose
+    CAS could lose the report, and the cursor never moves.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "no-origin-repeat.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="bez origin", assignee="default")
+        _subscribe(conn, tid, thread_id="")
+        kb.complete_task(conn, tid, summary="raport")
+    finally:
+        conn.close()
+
+    def cursor_now():
+        c = kb.connect()
+        try:
+            row = c.execute(
+                "SELECT last_event_id FROM kanban_notify_subs WHERE task_id = ?",
+                (tid,),
+            ).fetchone()
+            return row[0]
+        finally:
+            c.close()
+
+    before = cursor_now()
+    adapter = RecordingAdapter()
+    for _ in range(3):
+        runner = _make_runner(adapter)
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert cursor_now() == before
+    assert len(_unseen(tid, "C_ORIGIN")) == 1
+
+
+def test_wake_lane_still_delivers_without_a_thread_anchor(tmp_path, monkeypatch):
+    """A wake self-post re-enters the ORIGIN session — never suppress it.
+
+    A wake was never a top-level channel message, so the thread gate must not
+    take it away: that would be a "fix" that destroys the one delivery path
+    still reaching the requester. Only the visible channel ping is suppressed.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-no-thread.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake bez watku",
+            assignee="default",
+            session_id="agent:main:slack:group:C_ORIGIN:U1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="C_ORIGIN",
+            thread_id="",
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, tid, summary="raport dostarczony przez wake")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    # No visible top-level channel message...
+    assert adapter.sent == []
+    # ...but the origin session WAS woken, so the report is not lost.
+    assert len(adapter.handled) == 1
 
 
 def test_system_announcement_subscription_still_posts_top_level(

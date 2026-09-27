@@ -2911,6 +2911,16 @@ DEFAULT_CONFIG = {
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Platforms where a task-specific notification MUST be delivered into
+        # the thread carrying the original request. On these surfaces a
+        # threadless send becomes a new top-level channel message, so the
+        # notifier withholds a report whose origin thread was never recorded
+        # rather than guessing an anchor or posting at the channel root. Set
+        # to [] to allow top-level task reports everywhere (pre-2026-09
+        # behaviour). A subscription can still opt out per-row by carrying
+        # ``kanban_allow_top_level: true`` in its delivery_metadata — that is
+        # the deliberate system-wide-announcement lane.
+        "thread_only_platforms": ["slack"],
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
