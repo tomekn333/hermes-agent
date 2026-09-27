@@ -1040,3 +1040,92 @@ def test_local_paths_in_a_commit_subject_are_redacted_before_delivery(
     assert "[local path]" in text
     # The useful part of the report survives redaction.
     assert "Zapisano " in text
+
+
+def test_progress_lock_is_board_scoped_not_profile_scoped(tmp_path, monkeypatch):
+    """MEDIUM (review r3): the board is shared across profiles by design.
+
+    A lock under the per-profile HERMES_HOME would let two profiles' gateways
+    each believe they are the sole writer and double every progress event.
+    """
+    from hermes_cli import kanban_db as kb
+
+    root = tmp_path / "root"
+    (root / "profiles" / "beta").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "beta"))
+
+    lock_path = kb.kanban_home() / "kanban" / ".progress_reporter.lock"
+    assert lock_path.parent.parent == root
+    assert "profiles" not in str(lock_path)
+
+
+def test_two_watchers_on_one_board_write_the_event_once(tmp_path, monkeypatch, repo):
+    """The single-writer guard actually holds across two gateway instances."""
+    import asyncio
+
+    from hermes_cli import kanban_db as kb
+    from gateway.run import GatewayRunner
+
+    root = tmp_path / "shared"
+    (root / "kanban").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "two-writers.db"))
+    kb.init_db()
+    conn = kb.connect()
+    tid = kb.create_task(
+        conn,
+        title="dwa gatewaye",
+        assignee="default",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+    )
+    assert kb.claim_task(conn, tid) is not None
+    conn.close()
+
+    def _runner():
+        r = GatewayRunner.__new__(GatewayRunner)
+        r._running = True
+        r.adapters = {}
+        r._kanban_dispatcher_lock_handle = None
+        return r
+
+    a, b = _runner(), _runner()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"progress_reports": {"enabled": True}}},
+    )
+
+    async def _drive():
+        real_sleep = asyncio.sleep
+        state = {"a": 0, "b": 0}
+
+        async def run(runner, key):
+            async def fake_sleep(delay):
+                if delay == 10:
+                    return None
+                state[key] += 1
+                if state[key] >= 2:
+                    runner._running = False
+                await real_sleep(0)
+
+            monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+            await runner._kanban_progress_watcher(interval=1)
+
+        # Sequential is enough: the first holds the lock for its whole run,
+        # the second must find it free again afterwards (no leak).
+        await run(a, "a")
+        await run(b, "b")
+
+    asyncio.run(_drive())
+
+    conn = kb.connect()
+    try:
+        baselines = [
+            e for e in kb.list_events(conn, tid) if e.kind == BASELINE_EVENT
+        ]
+    finally:
+        conn.close()
+    # Exactly one baseline: the second watcher re-acquired the released lock
+    # but found the cursor already in place.
+    assert len(baselines) == 1

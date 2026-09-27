@@ -463,10 +463,13 @@ class GatewayKanbanWatchersMixin:
                     # missing guard is better than a dead feature, and the
                     # single-gateway case is the common one).
                     if not lock_resolved:
-                        from hermes_constants import get_hermes_home
-
+                        # Anchor the lock on the KANBAN root, not on
+                        # HERMES_HOME: the board is shared across profiles by
+                        # design, so a per-profile lock path would let two
+                        # profiles' gateways each believe they are the sole
+                        # writer and double every progress event.
                         lock_path = (
-                            get_hermes_home() / "kanban" / ".progress_reporter.lock"
+                            _kb.kanban_home() / "kanban" / ".progress_reporter.lock"
                         )
                         lock_handle, lock_state = _acquire_singleton_lock(lock_path)
                         if lock_state == "unavailable":
