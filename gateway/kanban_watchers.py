@@ -81,6 +81,77 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+#: Platforms where a task-specific report MUST be delivered into the thread
+#: that carries the original request. On these surfaces a threadless send
+#: becomes a brand-new top-level channel message, which is exactly the noise
+#: the owner asked us to stop producing (card t_08050af3, reversing the
+#: root-forcing policy of t_ab93e192 / commit 72d170c85).
+_DEFAULT_THREAD_ONLY_PLATFORMS = ("slack",)
+
+#: ``delivery_metadata`` flag that marks a subscription as a deliberate
+#: system-wide announcement lane. Only such a subscription may post
+#: task-specific-free top-level messages on a thread-only platform.
+_ALLOW_TOP_LEVEL_KEY = "kanban_allow_top_level"
+
+#: Minimum spacing between "withheld report" warnings for the SAME
+#: subscription. The withheld claim is rewound, so the gate re-fires on every
+#: notifier tick (5s) until an operator repairs the mapping.
+_ORPHAN_LOG_INTERVAL_SECONDS = 600.0
+
+
+def _thread_only_platforms() -> frozenset:
+    """Platforms that refuse threadless task reports.
+
+    Read from ``kanban.thread_only_platforms`` in config.yaml (list of
+    platform names) so an operator can extend or empty the set without a
+    code change. Fails **safe** onto :data:`_DEFAULT_THREAD_ONLY_PLATFORMS`:
+    a transient config read error must not silently re-enable top-level
+    posting that the owner turned off.
+    """
+    try:
+        from hermes_cli.config import load_config as _load_cfg
+
+        cfg = _load_cfg()
+        kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        raw = kcfg.get("thread_only_platforms", None)
+    except Exception:
+        raw = None
+    if raw is None:
+        return frozenset(_DEFAULT_THREAD_ONLY_PLATFORMS)
+    if isinstance(raw, str):
+        raw = [p for p in raw.replace(",", " ").split() if p]
+    try:
+        return frozenset(str(p).strip().lower() for p in raw if str(p).strip())
+    except TypeError:
+        return frozenset(_DEFAULT_THREAD_ONLY_PLATFORMS)
+
+
+def _origin_thread_missing(
+    platform: str, metadata: dict, sub: dict
+) -> bool:
+    """True when a task report would land as a new top-level message.
+
+    The gate is deliberately narrow: it fires only on a *thread-only*
+    platform, only when no origin thread anchor survived into ``metadata``,
+    and only when the subscription is not an explicit system-announcement
+    lane. Guessing an anchor (last thread in the channel, a title match) is
+    NOT attempted — a wrong thread is worse than a withheld report, so the
+    caller withholds the event and logs the mapping gap instead.
+    """
+    if str(platform or "").lower() not in _thread_only_platforms():
+        return False
+    if metadata.get("thread_id") or metadata.get("thread_ts"):
+        return False
+    delivery_metadata = sub.get("delivery_metadata")
+    if isinstance(delivery_metadata, dict) and delivery_metadata.get(
+        _ALLOW_TOP_LEVEL_KEY
+    ):
+        return False
+    if metadata.get(_ALLOW_TOP_LEVEL_KEY):
+        return False
+    return True
+
+
 def _kanban_dispatch_allowed() -> bool:
     """Return False while the global emergency stop (`hermes pause`) is engaged.
 
@@ -705,6 +776,52 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+
+                        # Technical task reports belong in the thread that
+                        # carries the original request, never as a fresh
+                        # top-level channel message (card t_08050af3). If the
+                        # origin anchor was never recorded we do NOT guess one
+                        # and do NOT post at the channel root: the claim is
+                        # rewound so the report survives on the board until
+                        # the mapping is repaired, and the gap is logged with
+                        # the identifiers an operator needs to fix it.
+                        if _origin_thread_missing(platform_str, metadata, sub):
+                            # Throttle: the claim is rewound, so this gate is
+                            # re-evaluated on every 5s tick until an operator
+                            # repairs the mapping. Log at most once per
+                            # subscription per _ORPHAN_LOG_INTERVAL_SECONDS so
+                            # a single unmapped task can't flood the log.
+                            _orphan_log_at = getattr(
+                                self, "_kanban_orphan_thread_log_at", None
+                            )
+                            if _orphan_log_at is None:
+                                _orphan_log_at = {}
+                                self._kanban_orphan_thread_log_at = _orphan_log_at
+                            _now = time.monotonic()
+                            if _now >= _orphan_log_at.get(sub_key, 0.0):
+                                _orphan_log_at[sub_key] = (
+                                    _now + _ORPHAN_LOG_INTERVAL_SECONDS
+                                )
+                                logger.warning(
+                                    "kanban notifier: withholding %s report for %s "
+                                    "on %s/%s (board %s): no origin thread recorded "
+                                    "for this subscription, and a task report must "
+                                    "not be posted as a new top-level message. "
+                                    "Repair the subscription's thread_id (or set "
+                                    "delivery_metadata.%s for a deliberate "
+                                    "system-wide announcement lane).",
+                                    kind, sub["task_id"], platform_str,
+                                    sub["chat_id"], board_slug,
+                                    _ALLOW_TOP_LEVEL_KEY,
+                                )
+                            await _to_thread_process_service(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
+                            )
+                            break
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
