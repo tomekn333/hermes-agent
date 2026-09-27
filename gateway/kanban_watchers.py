@@ -211,13 +211,21 @@ def _origin_thread_missing(
     """True when a task report would land as a new top-level message.
 
     The gate is deliberately narrow: it fires only on a *thread-only*
-    platform, only when no origin thread anchor survived into ``metadata``,
-    and only when the subscription is not an explicit system-announcement
-    lane. Guessing an anchor (last thread in the channel, a title match) is
-    NOT attempted — a wrong thread is worse than a withheld report, so the
-    caller withholds the event and logs the mapping gap instead.
+    platform, only for a CHANNEL-like conversation, only when no origin
+    thread anchor survived into ``metadata``, and only when the subscription
+    is not an explicit system-announcement lane. Guessing an anchor (last
+    thread in the channel, a title match) is NOT attempted — a wrong thread
+    is worse than a withheld report, so the caller withholds the event and
+    logs the mapping gap instead.
+
+    A **DM** is exempt: a Slack DM has no channel timeline to pollute, so a
+    threadless DM reply is the normal, correct delivery — never a "new
+    top-level channel message". Gating it would silence the report forever
+    (the DM genuinely has no thread_ts to repair).
     """
     if str(platform or "").lower() not in _thread_only_platforms():
+        return False
+    if _sub_is_direct_message(sub):
         return False
     if metadata.get("thread_id") or metadata.get("thread_ts"):
         return False
@@ -229,6 +237,23 @@ def _origin_thread_missing(
     if metadata.get(_ALLOW_TOP_LEVEL_KEY):
         return False
     return True
+
+
+def _sub_is_direct_message(sub: dict) -> bool:
+    """True when the subscription targets a 1:1 DM rather than a channel.
+
+    Keyed on the **conversation id**, not on ``chat_type``: ``add_notify_sub``
+    defaults that column to ``"dm"`` when the caller doesn't pass one
+    (``insert_chat_type = chat_type or "dm"``), so a legacy or tool-created
+    CHANNEL subscription is also stamped ``dm`` and trusting it would open the
+    gate for exactly the channel posts this change exists to stop. Slack DM
+    conversation ids start with ``D``; channels are ``C``/``G``. A recorded
+    non-DM ``chat_type`` is still honoured as a negative signal.
+    """
+    chat_type = str(sub.get("chat_type") or "").strip().lower()
+    if chat_type and chat_type not in {"dm", "direct", "private", "im"}:
+        return False
+    return str(sub.get("chat_id") or "").upper().startswith("D")
 
 
 def _kanban_dispatch_allowed() -> bool:

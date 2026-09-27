@@ -146,6 +146,54 @@ def test_explicit_system_announcement_lane_may_post_top_level():
     assert _origin_thread_missing("slack", {_ALLOW_TOP_LEVEL_KEY: True}, {}) is False
 
 
+def test_a_dm_is_never_gated():
+    """A DM has no channel timeline — a threadless DM reply is correct.
+
+    Gating it would silence the report forever: a DM genuinely has no
+    thread_ts an operator could repair.
+    """
+    # Slack DM conversation ids start with D.
+    assert _origin_thread_missing("slack", {}, {"chat_id": "D0123ABC"}) is False
+    assert _origin_thread_missing(
+        "slack", {}, {"chat_id": "D0123ABC", "chat_type": "dm"}
+    ) is False
+    # ...while a CHANNEL with the same missing anchor IS gated, even when the
+    # row carries chat_type='dm' — add_notify_sub defaults that column to 'dm',
+    # so it is not a trustworthy signal on its own.
+    assert _origin_thread_missing(
+        "slack", {}, {"chat_type": "dm", "chat_id": "C0123ABC"}
+    ) is True
+    assert _origin_thread_missing(
+        "slack", {}, {"chat_type": "group", "chat_id": "C0123ABC"}
+    ) is True
+
+
+def test_dm_subscription_is_delivered_without_a_thread(tmp_path, monkeypatch):
+    """End-to-end: a DM sub with no thread still gets its report."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "dm-no-thread.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="raport w DM", assignee="default")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="D0123ABC",
+            thread_id="",
+            chat_type="dm",
+        )
+        kb.complete_task(conn, tid, summary="raport DM")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "D0123ABC"
+
+
 # --- integration: the notifier tick ---------------------------------------
 
 
