@@ -166,6 +166,31 @@ def test_a_dm_is_never_gated():
     assert _origin_thread_missing(
         "slack", {}, {"chat_type": "group", "chat_id": "C0123ABC"}
     ) is True
+    # Group DM / MPIM (G...) has a shared timeline — treated as a channel.
+    assert _origin_thread_missing("slack", {}, {"chat_id": "G0123ABC"}) is True
+
+
+def test_dm_id_heuristic_is_slack_specific(monkeypatch):
+    """Another thread-only platform gets no 'D...' heuristic — fail closed.
+
+    A wrong "this is a DM" guess would publish a task report into a channel,
+    so a non-Slack platform must record an explicit DM chat_type instead.
+    """
+    import gateway.kanban_watchers as kw
+    import hermes_cli.config as hc
+
+    monkeypatch.setattr(kw, "_thread_only_cache", None)
+    monkeypatch.setattr(
+        hc, "load_config",
+        lambda: {"kanban": {"thread_only_platforms": ["slack", "mattermost"]}},
+    )
+    # 'D'-prefixed id on a non-Slack platform is NOT assumed to be a DM.
+    assert _origin_thread_missing("mattermost", {}, {"chat_id": "D0123ABC"}) is True
+    # ...an explicit DM chat_type is honoured there.
+    assert _origin_thread_missing(
+        "mattermost", {}, {"chat_id": "whatever", "chat_type": "dm"}
+    ) is False
+    monkeypatch.setattr(kw, "_thread_only_cache", None)
 
 
 def test_dm_subscription_is_delivered_without_a_thread(tmp_path, monkeypatch):

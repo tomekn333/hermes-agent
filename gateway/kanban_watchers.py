@@ -225,7 +225,7 @@ def _origin_thread_missing(
     """
     if str(platform or "").lower() not in _thread_only_platforms():
         return False
-    if _sub_is_direct_message(sub):
+    if _sub_is_direct_message(platform, sub):
         return False
     if metadata.get("thread_id") or metadata.get("thread_ts"):
         return False
@@ -239,20 +239,31 @@ def _origin_thread_missing(
     return True
 
 
-def _sub_is_direct_message(sub: dict) -> bool:
+def _sub_is_direct_message(platform: str, sub: dict) -> bool:
     """True when the subscription targets a 1:1 DM rather than a channel.
 
     Keyed on the **conversation id**, not on ``chat_type``: ``add_notify_sub``
     defaults that column to ``"dm"`` when the caller doesn't pass one
     (``insert_chat_type = chat_type or "dm"``), so a legacy or tool-created
     CHANNEL subscription is also stamped ``dm`` and trusting it would open the
-    gate for exactly the channel posts this change exists to stop. Slack DM
-    conversation ids start with ``D``; channels are ``C``/``G``. A recorded
+    gate for exactly the channel posts this change exists to stop. A recorded
     non-DM ``chat_type`` is still honoured as a negative signal.
+
+    The id heuristic is **Slack-specific** (``D...`` = DM; channels are
+    ``C...``, and a group DM / MPIM is ``G...``, deliberately treated as a
+    channel here — it has a shared timeline). Another platform added to
+    ``thread_only_platforms`` gets no id heuristic at all: it must record an
+    explicit DM ``chat_type``, otherwise the gate applies. Fail-closed by
+    design — a wrong "this is a DM" guess would publish a task report into a
+    channel.
     """
     chat_type = str(sub.get("chat_type") or "").strip().lower()
-    if chat_type and chat_type not in {"dm", "direct", "private", "im"}:
+    dm_types = {"dm", "direct", "private", "im"}
+    if chat_type and chat_type not in dm_types:
         return False
+    if str(platform or "").lower() != "slack":
+        # No id convention we can trust; require an explicit DM chat_type.
+        return chat_type in dm_types
     return str(sub.get("chat_id") or "").upper().startswith("D")
 
 
