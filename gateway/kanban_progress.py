@@ -430,6 +430,12 @@ def decide_for_task(
     if last is None:
         if current_head is None:
             return ProgressDecision("skip", reason="no-repo")
+        if run_id is None:
+            # A running task with no current_run_id cannot be baselined
+            # safely: the cursor would carry NULL and survive the per-run
+            # filter on the next attempt, replaying that attempt's commits.
+            # Wait for the run row instead — the dispatcher sets it on claim.
+            return ProgressDecision("skip", reason="no-run-id")
         return ProgressDecision(
             "baseline",
             baseline_sha=current_head,

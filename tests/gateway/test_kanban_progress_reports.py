@@ -496,10 +496,7 @@ def test_scan_board_writes_baseline_then_report_on_a_real_board(repo):
             workspace_kind="worktree",
             workspace_path=str(repo),
         )
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET status='running' WHERE id=?", (task_id,)
-            )
+        assert kb.claim_task(conn, task_id) is not None
         settings = ProgressSettings(min_interval_seconds=0, silence_minutes=1)
 
         tally = scan_board(conn, kb=kb, settings=settings)
@@ -596,8 +593,9 @@ def _live_board(tmp_path, monkeypatch, name, repo):
         workspace_kind="worktree",
         workspace_path=str(repo),
     )
-    with kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+    # Use the real claim path so the task gets a current_run_id, exactly
+    # like a dispatcher-spawned worker does.
+    assert kb.claim_task(conn, tid) is not None
     kb.add_notify_sub(
         conn,
         task_id=tid,
@@ -671,8 +669,7 @@ def test_progress_without_an_origin_thread_is_withheld_not_broadcast(
             workspace_kind="worktree",
             workspace_path=str(repo),
         )
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid) is not None
         kb.add_notify_sub(
             conn, task_id=tid, platform="slack", chat_id="C_NOTHREAD", thread_id=""
         )
@@ -882,3 +879,164 @@ def test_progress_is_not_delivered_after_the_task_is_blocked(
     texts = [s["text"] for s in adapter.sent]
     assert not any("Praca trwa." in t for t in texts)
     assert any("blocked" in t for t in texts)
+
+
+# --- regressions from the independent review (round 2) --------------------
+
+
+def test_running_task_without_a_run_id_is_not_baselined(repo):
+    """MEDIUM: a NULL-run baseline would survive the per-run filter.
+
+    Same replay class as the round-1 HIGH, reached through a different
+    door: a running row whose current_run_id is not set yet.
+    """
+    d = decide_for_task(
+        task=_task(workspace_path=str(repo), current_run_id=None),
+        events=[],
+        settings=ProgressSettings(),
+        now=int(time.time()),
+    )
+    assert d.action == "skip"
+    assert d.reason == "no-run-id"
+
+
+def test_progress_reporting_works_without_the_dispatcher_lock(
+    tmp_path, monkeypatch, repo
+):
+    """MEDIUM: the feature must not be silently dead when this gateway is
+    not the dispatcher (`kanban.dispatch_in_gateway: false`)."""
+    import asyncio
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "no-dispatch.db"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    (tmp_path / "home" / "kanban").mkdir(parents=True)
+    kb.init_db()
+    conn = kb.connect()
+    tid = kb.create_task(
+        conn,
+        title="bez dispatchera",
+        assignee="default",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+    )
+    assert kb.claim_task(conn, tid) is not None
+    kb.add_notify_sub(
+        conn, task_id=tid, platform="slack", chat_id="C_ORIGIN", thread_id="1.2"
+    )
+    conn.close()
+
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.SLACK: _RecordingAdapter()}
+    # Explicitly NOT the dispatcher.
+    runner._kanban_dispatcher_lock_handle = None
+
+    real_sleep = asyncio.sleep
+    ticks = {"n": 0}
+
+    async def fake_sleep(delay):
+        if delay == 10:
+            return None
+        ticks["n"] += 1
+        if ticks["n"] >= 2:
+            runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"progress_reports": {"enabled": True}}},
+    )
+    asyncio.run(runner._kanban_progress_watcher(interval=1))
+
+    conn = kb.connect()
+    try:
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    finally:
+        conn.close()
+    assert BASELINE_EVENT in kinds
+
+
+def test_disabled_config_writes_nothing(tmp_path, monkeypatch, repo):
+    """The owner's off switch must actually stop the writer."""
+    import asyncio
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "disabled.db"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home2"))
+    (tmp_path / "home2" / "kanban").mkdir(parents=True)
+    kb.init_db()
+    conn = kb.connect()
+    tid = kb.create_task(
+        conn,
+        title="wylaczone",
+        assignee="default",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+    )
+    assert kb.claim_task(conn, tid) is not None
+    conn.close()
+
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    runner._kanban_dispatcher_lock_handle = object()
+
+    real_sleep = asyncio.sleep
+    ticks = {"n": 0}
+
+    async def fake_sleep(delay):
+        if delay == 10:
+            return None
+        ticks["n"] += 1
+        if ticks["n"] >= 2:
+            runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"progress_reports": {"enabled": "false"}}},
+    )
+    asyncio.run(runner._kanban_progress_watcher(interval=1))
+
+    conn = kb.connect()
+    try:
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    finally:
+        conn.close()
+    assert BASELINE_EVENT not in kinds and PROGRESS_EVENT not in kinds
+
+
+def test_local_paths_in_a_commit_subject_are_redacted_before_delivery(
+    tmp_path, monkeypatch, repo
+):
+    """MEDIUM: worker free text reaches an external surface — redact it."""
+    import asyncio
+
+    kb, conn, tid = _live_board(tmp_path, monkeypatch, "progress-redact.db", repo)
+    settings = ProgressSettings(min_interval_seconds=0)
+    try:
+        scan_board(conn, kb=kb, settings=settings)
+        _commit(repo, "poprawka w /home/tomek/secrets/klucz.txt")
+        assert scan_board(conn, kb=kb, settings=settings)["reported"] == 1
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "/home/tomek/secrets/klucz.txt" not in text
+    assert "[local path]" in text
+    # The useful part of the report survives redaction.
+    assert "Zapisano " in text

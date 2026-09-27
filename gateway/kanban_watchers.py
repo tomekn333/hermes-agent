@@ -418,9 +418,10 @@ class GatewayKanbanWatchersMixin:
         thread routing and rate limiting are the notifier's job — this loop
         only produces evidence.
 
-        Runs only on the gateway that owns the dispatcher singleton lock, so
-        a multi-gateway deployment writes each progress event exactly once.
-        Settings are re-read every tick, so flipping
+        Single-writer: this loop takes its OWN advisory lock rather than
+        riding on the dispatcher's, so a deployment with
+        ``kanban.dispatch_in_gateway: false`` still gets reports. Settings
+        are re-read every tick, so flipping
         ``kanban.progress_reports.enabled`` to false stops the reports on
         the next tick without a gateway restart.
         """
@@ -434,73 +435,117 @@ class GatewayKanbanWatchersMixin:
             return
 
         await asyncio.sleep(10)
-        while self._running:
-            sleep_for = float(interval) if interval else 60.0
-            try:
+        lock_handle = None
+        lock_resolved = False
+        warned_contended = False
+        try:
+            while self._running:
+                sleep_for = float(interval) if interval else 60.0
                 try:
-                    from hermes_cli.config import load_config as _load_cfg
-
-                    settings = ProgressSettings.from_config(_load_cfg())
-                except Exception:
-                    # Fail SAFE: a config read error must not re-enable a
-                    # feature the owner switched off, nor take the loop down.
-                    settings = ProgressSettings(enabled=False)
-                sleep_for = float(settings.interval_seconds)
-                if not settings.enabled:
-                    continue
-                if not self._owns_kanban_dispatcher_lock():
-                    continue
-
-                def _tick():
                     try:
-                        boards = _kb.list_boards(include_archived=False)
-                    except Exception:
-                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-                    seen: set = set()
-                    total = {"checked": 0, "baselined": 0, "reported": 0}
-                    for board_meta in boards:
-                        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
-                        db_path = board_meta.get("db_path")
-                        try:
-                            resolved = (
-                                str(Path(db_path).expanduser().resolve())
-                                if db_path
-                                else str(_kb.kanban_db_path(slug).resolve())
-                            )
-                        except Exception:
-                            resolved = f"slug:{slug}"
-                        if resolved in seen:
-                            continue
-                        seen.add(resolved)
-                        try:
-                            conn = _kb.connect(board=slug)
-                        except Exception as exc:
-                            logger.debug(
-                                "kanban progress: cannot open board %s: %s", slug, exc
-                            )
-                            continue
-                        try:
-                            tally = scan_board(conn, kb=_kb, settings=settings)
-                            for key in total:
-                                total[key] += tally.get(key, 0)
-                        finally:
-                            conn.close()
-                    return total
+                        from hermes_cli.config import load_config as _load_cfg
 
-                tally = await _to_thread_process_service(_tick)
-                if tally.get("reported") or tally.get("baselined"):
-                    logger.debug(
-                        "kanban progress: checked=%s baselined=%s reported=%s",
-                        tally.get("checked"),
-                        tally.get("baselined"),
-                        tally.get("reported"),
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("kanban progress: tick failed: %s", exc)
-            finally:
-                await asyncio.sleep(max(5.0, sleep_for))
+                        settings = ProgressSettings.from_config(_load_cfg())
+                    except Exception:
+                        # Fail SAFE: a config read error must not re-enable a
+                        # feature the owner switched off, nor take the loop
+                        # down.
+                        settings = ProgressSettings(enabled=False)
+                    sleep_for = float(settings.interval_seconds)
+                    if not settings.enabled:
+                        continue
+                    # Progress events must be written once machine-wide. This
+                    # must NOT ride on the dispatcher's lock: with
+                    # `kanban.dispatch_in_gateway: false` that handle is never
+                    # taken, and the feature would be silently dead while the
+                    # config says it is enabled. Take our own lock instead,
+                    # and proceed when advisory locking is unavailable (a
+                    # missing guard is better than a dead feature, and the
+                    # single-gateway case is the common one).
+                    if not lock_resolved:
+                        from hermes_constants import get_hermes_home
+
+                        lock_path = (
+                            get_hermes_home() / "kanban" / ".progress_reporter.lock"
+                        )
+                        lock_handle, lock_state = _acquire_singleton_lock(lock_path)
+                        if lock_state == "unavailable":
+                            lock_resolved = True
+                            logger.warning(
+                                "kanban progress: advisory locking unavailable "
+                                "at %s; proceeding without a single-writer "
+                                "guard. If several gateways serve this board, "
+                                "progress events may be written more than once.",
+                                lock_path,
+                            )
+                        elif lock_state == "contended":
+                            # Another process owns the writer role. Retry on
+                            # later ticks so this gateway takes over if that
+                            # process exits.
+                            if not warned_contended:
+                                warned_contended = True
+                                logger.info(
+                                    "kanban progress: another process owns the "
+                                    "progress-reporter lock; this gateway will "
+                                    "not write progress events while it holds it."
+                                )
+                            continue
+                        else:
+                            lock_resolved = True
+
+                    def _tick():
+                        try:
+                            boards = _kb.list_boards(include_archived=False)
+                        except Exception:
+                            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                        seen: set = set()
+                        total = {"checked": 0, "baselined": 0, "reported": 0}
+                        for board_meta in boards:
+                            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                            db_path = board_meta.get("db_path")
+                            try:
+                                resolved = (
+                                    str(Path(db_path).expanduser().resolve())
+                                    if db_path
+                                    else str(_kb.kanban_db_path(slug).resolve())
+                                )
+                            except Exception:
+                                resolved = f"slug:{slug}"
+                            if resolved in seen:
+                                continue
+                            seen.add(resolved)
+                            try:
+                                conn = _kb.connect(board=slug)
+                            except Exception as exc:
+                                logger.debug(
+                                    "kanban progress: cannot open board %s: %s",
+                                    slug, exc,
+                                )
+                                continue
+                            try:
+                                tally = scan_board(conn, kb=_kb, settings=settings)
+                                for key in total:
+                                    total[key] += tally.get(key, 0)
+                            finally:
+                                conn.close()
+                        return total
+
+                    tally = await _to_thread_process_service(_tick)
+                    if tally.get("reported") or tally.get("baselined"):
+                        logger.debug(
+                            "kanban progress: checked=%s baselined=%s reported=%s",
+                            tally.get("checked"),
+                            tally.get("baselined"),
+                            tally.get("reported"),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("kanban progress: tick failed: %s", exc)
+                finally:
+                    await asyncio.sleep(max(5.0, sleep_for))
+        finally:
+            _release_singleton_lock(lock_handle)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -993,7 +1038,14 @@ class GatewayKanbanWatchersMixin:
                                 format_event_for_delivery,
                             )
 
-                            body = format_event_for_delivery(ev.payload)
+                            # Commit subjects and declared stages are
+                            # worker-authored free text heading to an
+                            # external surface, so they go through the same
+                            # redaction the review-reason path uses: secrets
+                            # scrubbed, local paths masked, length capped.
+                            body = _safe_review_reason(
+                                format_event_for_delivery(ev.payload), 400
+                            )
                             msg = (
                                 f"⏳ {board_tag}{tag}Kanban {sub['task_id']}"
                                 f" — {title}\n{body}"
