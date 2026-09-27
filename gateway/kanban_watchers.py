@@ -407,6 +407,101 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    async def _kanban_progress_watcher(self, interval: Optional[float] = None) -> None:
+        """Emit evidence-based ``progress`` events for live workers (t_d283fa6a).
+
+        One tick per :attr:`ProgressSettings.interval_seconds` runs a cheap
+        ``git rev-parse`` per running task with a workspace, compares it
+        against the cursor stored in the task's own event log, and appends a
+        ``progress`` event when a REAL commit appeared (or a single honest
+        "no confirmed progress" note after a quiet stretch). Delivery,
+        thread routing and rate limiting are the notifier's job — this loop
+        only produces evidence.
+
+        Runs only on the gateway that owns the dispatcher singleton lock, so
+        a multi-gateway deployment writes each progress event exactly once.
+        Settings are re-read every tick, so flipping
+        ``kanban.progress_reports.enabled`` to false stops the reports on
+        the next tick without a gateway restart.
+        """
+        try:
+            from hermes_cli import kanban_db as _kb
+            from gateway.kanban_progress import ProgressSettings, scan_board
+        except Exception:
+            logger.warning(
+                "kanban progress: module not importable; progress reports disabled"
+            )
+            return
+
+        await asyncio.sleep(10)
+        while self._running:
+            sleep_for = float(interval) if interval else 60.0
+            try:
+                try:
+                    from hermes_cli.config import load_config as _load_cfg
+
+                    settings = ProgressSettings.from_config(_load_cfg())
+                except Exception:
+                    # Fail SAFE: a config read error must not re-enable a
+                    # feature the owner switched off, nor take the loop down.
+                    settings = ProgressSettings(enabled=False)
+                sleep_for = float(settings.interval_seconds)
+                if not settings.enabled:
+                    continue
+                if not self._owns_kanban_dispatcher_lock():
+                    continue
+
+                def _tick():
+                    try:
+                        boards = _kb.list_boards(include_archived=False)
+                    except Exception:
+                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    seen: set = set()
+                    total = {"checked": 0, "baselined": 0, "reported": 0}
+                    for board_meta in boards:
+                        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                        db_path = board_meta.get("db_path")
+                        try:
+                            resolved = (
+                                str(Path(db_path).expanduser().resolve())
+                                if db_path
+                                else str(_kb.kanban_db_path(slug).resolve())
+                            )
+                        except Exception:
+                            resolved = f"slug:{slug}"
+                        if resolved in seen:
+                            continue
+                        seen.add(resolved)
+                        try:
+                            conn = _kb.connect(board=slug)
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban progress: cannot open board %s: %s", slug, exc
+                            )
+                            continue
+                        try:
+                            tally = scan_board(conn, kb=_kb, settings=settings)
+                            for key in total:
+                                total[key] += tally.get(key, 0)
+                        finally:
+                            conn.close()
+                    return total
+
+                tally = await _to_thread_process_service(_tick)
+                if tally.get("reported") or tally.get("baselined"):
+                    logger.debug(
+                        "kanban progress: checked=%s baselined=%s reported=%s",
+                        tally.get("checked"),
+                        tally.get("baselined"),
+                        tally.get("reported"),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("kanban progress: tick failed: %s", exc)
+            finally:
+                await asyncio.sleep(max(5.0, sleep_for))
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -449,7 +544,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "progress")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -878,6 +973,28 @@ class GatewayKanbanWatchersMixin:
                                 f"changes/BLOCK: {reason_text}{provenance}"
                             )
                             wake_review_detail = reason_text
+                        elif kind == "progress":
+                            # Evidence-based progress note (card t_d283fa6a):
+                            # a real commit observed in the worker's
+                            # workspace, or an honest "no confirmed progress"
+                            # after a quiet stretch. The text is frozen in the
+                            # payload at write time so a later wording change
+                            # cannot rewrite what the user was already told.
+                            if task and task.status in ("done", "archived"):
+                                # The task finished between the write and this
+                                # tick. A "work continues" line after the DONE
+                                # message is worse than silence; the event is
+                                # still claimed so the cursor moves past it.
+                                continue
+                            from gateway.kanban_progress import (
+                                format_event_for_delivery,
+                            )
+
+                            body = format_event_for_delivery(ev.payload)
+                            msg = (
+                                f"⏳ {board_tag}{tag}Kanban {sub['task_id']}"
+                                f" — {title}\n{body}"
+                            )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a

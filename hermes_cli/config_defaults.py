@@ -2921,6 +2921,32 @@ DEFAULT_CONFIG = {
         # ``kanban_allow_top_level: true`` in its delivery_metadata — that is
         # the deliberate system-wide-announcement lane.
         "thread_only_platforms": ["slack"],
+        # Short, evidence-based progress reports delivered into the origin
+        # request thread while a worker runs (card t_d283fa6a). A report is
+        # emitted only for a real git commit observed in the worker's
+        # workspace, or — after a configurable quiet stretch — as an honest
+        # "no confirmed progress" note. Never an LLM call, never an
+        # inference about what the worker "is probably doing".
+        "progress_reports": {
+            "enabled": True,
+            # Watcher tick spacing (seconds).
+            "interval_seconds": 60,
+            # Quiet stretch after which ONE "no confirmed progress" note is
+            # posted. Bounded: the note does not repeat until real evidence
+            # (a commit) appears again.
+            "silence_minutes": 10,
+            # Minimum spacing between two progress reports for the same
+            # task; a burst of commits inside the window is coalesced into
+            # a single message on the next tick.
+            "min_interval_seconds": 120,
+            # Commit subjects named verbatim before the rest is summarised
+            # as "(+N dalszych commitow)".
+            "max_commits_per_report": 3,
+            # A stage declaration (kanban_heartbeat note, progress_stage
+            # event, or .hermes/stage.txt in the workspace) older than this
+            # is treated as unknown rather than reported as "now".
+            "stage_max_age_minutes": 30,
+        },
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

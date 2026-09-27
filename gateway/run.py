@@ -14776,6 +14776,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # simply don't use kanban; this loop becomes a no-op.
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
 
+        # Start background kanban progress reporter — appends evidence-based
+        # `progress` events (real commits / honest silence notes) that the
+        # notifier above delivers into the origin request thread. Gated by
+        # `kanban.progress_reports.enabled` (default True), re-read per tick.
+        self._spawn_supervised(self._kanban_progress_watcher, "kanban_progress_watcher")
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
