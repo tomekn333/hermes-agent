@@ -592,7 +592,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "progress")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "progress", "continued")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -964,10 +964,20 @@ class GatewayKanbanWatchersMixin:
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
+                            if ev.payload and ev.payload.get("reason_kind") == "budget_exhausted":
+                                # Lokalny patch 2026-10-08: budzet iteracji, nie spawn.
+                                _ho = _safe_review_reason(str(ev.payload.get("handoff") or "(brak handoffu)"), 700)
+                                _dec = str(ev.payload.get("decision") or "")
+                                msg = (
+                                    f"🛑 {board_tag}{tag}Kanban {sub['task_id']} — {title}\n"
+                                    f"Zatrzymane: wyczerpany budzet iteracji{err}\n"
+                                    f"Ostatni stan (handoff):\n{_ho}\n{_dec}"
+                                )
+                            else:
+                                msg = (
+                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+                                    f"after repeated spawn failures{err}"
+                                )
                         elif kind == "crashed":
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
@@ -1052,6 +1062,18 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏳ {board_tag}{tag}Kanban {sub['task_id']}"
                                 f" — {title}\n{body}"
+                            )
+                        elif kind == "continued":
+                            # Lokalny patch 2026-10-08: budzet runu wyczerpany,
+                            # ale byl postep — kolejny run rusza sam od handoffu.
+                            _p = ev.payload or {}
+                            _ho = _safe_review_reason(str(_p.get("summary") or ""), 300)
+                            msg = (
+                                f"↻ {board_tag}{tag}Kanban {sub['task_id']} — {title}\n"
+                                f"Budzet runu wyczerpany, postep: {_p.get('commits', '?')} commit(ow). "
+                                f"Kontynuacja {_p.get('continuation_n', '?')}/{_p.get('continuation_limit', '?')} "
+                                f"rusza automatycznie od handoffu."
+                                + (f"\n{_ho}" if _ho else "")
                             )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the

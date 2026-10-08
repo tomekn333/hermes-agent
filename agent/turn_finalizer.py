@@ -70,6 +70,7 @@ def _record_kanban_budget_exhausted(
     api_call_count: int,
     max_iterations: int,
     logger: logging.Logger,
+    summary: "str | None" = None,
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker that
     exhausted its iteration budget.
@@ -83,6 +84,25 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
         try:
+            # Lokalny patch 2026-10-08: ciaglosc zamiast restartu. Handoff
+            # trafia do task_runs.summary; run z postepem (commity) konczy sie
+            # kontynuacja bez nabijania licznika porazek.
+            if hasattr(_kb, "record_budget_exhausted"):
+                try:
+                    _kb.record_budget_exhausted(
+                        _conn,
+                        kanban_task,
+                        summary=summary,
+                        used=api_call_count,
+                        max_iterations=max_iterations,
+                        workspace=os.environ.get("HERMES_KANBAN_WORKSPACE"),
+                    )
+                    return
+                except Exception:
+                    logger.warning(
+                        "record_budget_exhausted failed for %s — fallback",
+                        kanban_task, exc_info=True,
+                    )
             _kb._record_task_failure(
                 _conn,
                 kanban_task,
@@ -224,6 +244,7 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                summary=final_response if isinstance(final_response, str) else None,
             )
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the
@@ -238,6 +259,7 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                summary=final_response if isinstance(final_response, str) else None,
             )
 
     # Determine if conversation completed successfully

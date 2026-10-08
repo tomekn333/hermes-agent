@@ -9528,6 +9528,167 @@ def _record_task_failure(
 
 # Backward-compat alias. Old name is referenced from tests and possibly
 # third-party callers. New code should call ``_record_task_failure``.
+# ---------------------------------------------------------------------------
+# Lokalny patch (Tomek, 2026-10-08): ciaglosc po wyczerpaniu budzetu iteracji.
+# ---------------------------------------------------------------------------
+# Wczesniej: 200/200 iteracji -> run ``timed_out`` z samym bledem (handoff
+# agenta przepadal), licznik porazek +1, po 2 takich runach ``blocked`` z
+# komunikatem "gave up after repeated spawn failures". Teraz:
+#   * handoff agenta zawsze trafia do ``task_runs.summary`` (nastepny run widzi
+#     go jako "Prior attempt" i nie robi rozpoznania od zera);
+#   * run, w ktorym POWSTALY commity, to KONTYNUACJA: zadanie wraca do kolejki,
+#     licznik porazek sie zeruje, maks. BUDGET_CONTINUATION_LIMIT kontynuacji;
+#   * run bez postepu liczy sie jako porazka (stary bezpiecznik, limit 2);
+#   * po wyczerpaniu limitu kontynuacji albo bezpiecznika karta idzie do
+#     ``blocked`` z handoffem i opcjami decyzji w evencie ``gave_up``.
+BUDGET_CONTINUATION_LIMIT = 4
+_BUDGET_DECISION_OPTIONS = (
+    "Co dalej (odpowiedz w watku): 'kontynuuj' = kolejny run od handoffu; "
+    "'zawez: <co zostawic>' = okrojenie zakresu; 'porzuc' = archiwizacja."
+)
+
+
+def _commits_since(workspace: Optional[str], since_ts: int) -> Optional[list]:
+    """Commity na HEAD workspace'u od ``since_ts`` (None = nie da sie ustalic)."""
+    if not workspace or not os.path.isdir(workspace) or not since_ts:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workspace, "log", "HEAD",
+             f"--since=@{int(since_ts)}", "--format=%h %s", "-n", "50"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def _progress_commits_from_events(conn, task_id: str, since_ts: int) -> list:
+    """Zapasowe zrodlo postepu: eventy ``progress`` z commitami (gateway)."""
+    out = []
+    try:
+        rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'progress' "
+            "AND created_at >= ?", (task_id, int(since_ts or 0)),
+        ).fetchall()
+    except Exception:
+        return out
+    for r in rows:
+        try:
+            p = json.loads(r["payload"] or "{}")
+        except Exception:
+            continue
+        for c in p.get("commits") or []:
+            if isinstance(c, dict) and c.get("sha"):
+                out.append(f"{c['sha']} {c.get('subject', '')}".strip())
+    return out
+
+
+def record_budget_exhausted(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    used: int,
+    max_iterations: int,
+    workspace: Optional[str] = None,
+    continuation_limit: Optional[int] = None,
+    failure_limit: Optional[int] = None,
+) -> dict:
+    """Zamknij run po wyczerpaniu budzetu: kontynuacja (postep) albo porazka."""
+    limit = BUDGET_CONTINUATION_LIMIT if continuation_limit is None else int(continuation_limit)
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or not row["current_run_id"]:
+        return {"action": "noop"}
+    run = conn.execute(
+        "SELECT started_at FROM task_runs WHERE id = ?", (row["current_run_id"],),
+    ).fetchone()
+    started = int(run["started_at"] or 0) if run else 0
+    commits = _commits_since(workspace, started)
+    if not commits:
+        commits = _progress_commits_from_events(conn, task_id, started) or commits
+    commits = commits or []
+    prior = conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
+        "AND metadata LIKE '%\"continuation\": true%'", (task_id,),
+    ).fetchone()[0]
+    summ = (summary or "").strip() or None
+    base_err = f"Iteration budget exhausted ({used}/{max_iterations})"
+
+    if commits and prior < limit:
+        n = int(prior) + 1
+        with write_txn(conn):
+            retry_status = _retry_status_for_run(conn, task_id, row["current_run_id"])
+            err = (f"{base_err} — kontynuacja {n}/{limit} "
+                   f"(postep: {len(commits)} commit(ow) w tym runie)")
+            run_id = _end_run(
+                conn, task_id,
+                outcome="timed_out", status="timed_out",
+                summary=summ, error=err,
+                metadata={
+                    "continuation": True,
+                    "continuation_n": n,
+                    "continuation_limit": limit,
+                    "commits": commits[:10],
+                    "budget_used": used,
+                    "budget_max": max_iterations,
+                    "retry_status": retry_status,
+                },
+            )
+            conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL, consecutive_failures = 0 "
+                "WHERE id = ? AND status = 'running'",
+                (retry_status, task_id),
+            )
+            _append_event(
+                conn, task_id, "continued",
+                {
+                    "continuation_n": n,
+                    "continuation_limit": limit,
+                    "commits": len(commits),
+                    "summary": (summ or "")[:600],
+                },
+                run_id=run_id,
+            )
+        return {"action": "continued", "n": n, "commits": len(commits)}
+
+    if commits:
+        reason = (f"limit {limit} kontynuacji wyczerpany mimo postepu — "
+                  "potrzebna decyzja (zadanie wieksze niz zakladano?)")
+        force = True
+    else:
+        reason = "brak nowych commitow w tym runie"
+        force = False
+    err = f"{base_err} — {reason}"
+    blocked = _record_task_failure(
+        conn, task_id, error=err, outcome="timed_out",
+        failure_limit=failure_limit, force_trip=force,
+        release_claim=True, end_run=True,
+        event_payload_extra={
+            "budget_used": used,
+            "budget_max": max_iterations,
+            "handoff": (summ or "")[:1500],
+            "decision": _BUDGET_DECISION_OPTIONS,
+            "reason_kind": "budget_exhausted",
+        },
+    )
+    if summ:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET summary = ? WHERE id = ("
+                "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1) AND summary IS NULL",
+                (summ, task_id),
+            )
+    return {"action": "blocked" if blocked else "retry", "commits": len(commits)}
+
+
 def _record_spawn_failure(
     conn: sqlite3.Connection,
     task_id: str,

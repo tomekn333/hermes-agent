@@ -3212,6 +3212,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
+    # Lokalny patch 2026-10-08: worker Kanbana pisze ustrukturyzowany HANDOFF.
+    try:
+        from agent.kanban_continuity import summary_request as _kb_summary_request
+        summary_request = _kb_summary_request(summary_request)
+    except Exception:
+        pass
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"

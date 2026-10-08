@@ -4054,6 +4054,20 @@ def delegate_task(
     if isinstance(tasks, list) and not tasks:
         tasks = None
 
+    # Lokalny patch 2026-10-08: twardy limit rund review per watek karty Kanban.
+    try:
+        from agent.kanban_review_guard import check_review_spawn as _kb_review_guard
+        _texts = [goal, context]
+        if isinstance(tasks, list):
+            for _t in tasks:
+                if isinstance(_t, dict):
+                    _texts.extend([_t.get("goal"), _t.get("context")])
+        _refusal = _kb_review_guard(_texts)
+        if _refusal:
+            return tool_error(_refusal)
+    except Exception:
+        pass
+
     if tasks and isinstance(tasks, list):
         if len(tasks) > max_children:
             return tool_error(

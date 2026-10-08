@@ -2326,6 +2326,12 @@ def run_conversation(
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
+        # Lokalny patch 2026-10-08: checkpoint workera Kanbana przy ~85% budzetu.
+        try:
+            from agent.kanban_continuity import maybe_inject_checkpoint as _kb_ckpt
+            _kb_ckpt(agent, messages, api_call_count)
+        except Exception:
+            pass
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
