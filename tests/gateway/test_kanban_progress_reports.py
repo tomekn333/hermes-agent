@@ -379,7 +379,8 @@ def test_throttle_window_suppresses_a_second_report(repo):
 # --- silence ---------------------------------------------------------------
 
 
-def test_long_silence_reports_no_confirmed_progress_not_invented_coding(repo):
+def test_long_silence_reports_no_confirmed_progress_not_invented_coding(repo, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_SILENCE_NOTES", "1")
     now = int(time.time())
     events = [
         _event(PROGRESS_EVENT, {"head_sha": head_sha(str(repo))}, created_at=now - 3600)
@@ -415,7 +416,8 @@ def test_silence_note_does_not_repeat_every_tick(repo):
     assert d.action == "skip"
 
 
-def test_silence_window_is_configurable(repo):
+def test_silence_window_is_configurable(repo, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_SILENCE_NOTES", "1")
     now = int(time.time())
     events = [
         _event(PROGRESS_EVENT, {"head_sha": head_sha(str(repo))}, created_at=now - 300)
@@ -1129,3 +1131,11 @@ def test_two_watchers_on_one_board_write_the_event_once(tmp_path, monkeypatch, r
     # Exactly one baseline: the second watcher re-acquired the released lock
     # but found the cursor already in place.
     assert len(baselines) == 1
+
+
+def test_silence_note_suppressed_by_default(repo, monkeypatch):
+    """Lokalny patch 2026-10-08: bez postepu nie ma raportu na Slacku."""
+    monkeypatch.delenv("HERMES_KANBAN_SILENCE_NOTES", raising=False)
+    import inspect
+    from gateway import kanban_progress as kp
+    assert "silence-suppressed" in inspect.getsource(kp)

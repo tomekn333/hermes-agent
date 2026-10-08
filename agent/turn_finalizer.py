@@ -241,6 +241,9 @@ def finalize_turn(
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        # Lokalny patch 2026-10-08: budzet SUBAGENTA nie zamyka runu workera.
+        if getattr(agent, "_delegate_depth", 0) > 0:
+            _kanban_task = None
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
@@ -256,6 +259,9 @@ def finalize_turn(
         # is a no-op if another path closed it — the CAS invariant in
         # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        # Lokalny patch 2026-10-08: budzet SUBAGENTA nie zamyka runu workera.
+        if getattr(agent, "_delegate_depth", 0) > 0:
+            _kanban_task = None
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,

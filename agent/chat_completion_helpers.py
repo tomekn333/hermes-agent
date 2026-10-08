@@ -3215,7 +3215,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     # Lokalny patch 2026-10-08: worker Kanbana pisze ustrukturyzowany HANDOFF.
     try:
         from agent.kanban_continuity import summary_request as _kb_summary_request
-        summary_request = _kb_summary_request(summary_request)
+        summary_request = _kb_summary_request(summary_request, agent)
     except Exception:
         pass
 

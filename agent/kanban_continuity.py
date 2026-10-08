@@ -69,6 +69,8 @@ def maybe_inject_checkpoint(agent, messages, api_call_count) -> bool:
     try:
         if not kanban_task_id():
             return False
+        if getattr(agent, "_delegate_depth", 0) > 0:
+            return False  # subagent nie jest workerem karty
         if getattr(agent, "_kanban_checkpoint_sent", False):
             return False
         if not checkpoint_due(api_call_count, getattr(agent, "max_iterations", 0)):
@@ -94,5 +96,7 @@ def maybe_inject_checkpoint(agent, messages, api_call_count) -> bool:
         return False
 
 
-def summary_request(default: str) -> str:
+def summary_request(default: str, agent=None) -> str:
+    if agent is not None and getattr(agent, "_delegate_depth", 0) > 0:
+        return default
     return HANDOFF_REQUEST if kanban_task_id() else default

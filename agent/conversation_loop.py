@@ -9093,6 +9093,11 @@ def run_conversation(
                     logger.debug("kanban stop-loop check failed", exc_info=True)
                     _kanban_nudge = None
 
+                # Lokalny patch 2026-10-08: subagent (np. recenzent) dziedziczy
+                # HERMES_KANBAN_TASK, ale NIE jest workerem — nie zmuszamy go do
+                # kanban_complete (petla nudge'y + obciete odpowiedzi).
+                if getattr(agent, "_delegate_depth", 0) > 0:
+                    _kanban_nudge = None
                 if _kanban_nudge:
                     agent._kanban_stop_nudges = (
                         getattr(agent, "_kanban_stop_nudges", 0) + 1

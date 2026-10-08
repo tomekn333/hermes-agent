@@ -27,6 +27,7 @@ without a gateway, a git daemon or a Slack workspace.
 
 from __future__ import annotations
 
+import os
 import json
 import logging
 import subprocess
@@ -474,9 +475,11 @@ def decide_for_task(
         }
         return ProgressDecision("report", payload=payload, reason="new-commits")
 
-    # No new commit. One bounded silence note per quiet stretch: if the last
-    # thing we said was already "no confirmed progress", stay quiet until
-    # real evidence appears.
+    # No new commit. Lokalny patch 2026-10-08 (Tomek): "nie potrzebuje raportu
+    # progresu, jesli nic nie posuwa sie do przodu" — notatki o braku postepu
+    # nie ida na Slacka. Ustawienie HERMES_KANBAN_SILENCE_NOTES=1 przywraca je.
+    if os.environ.get("HERMES_KANBAN_SILENCE_NOTES", "0") != "1":
+        return ProgressDecision("skip", reason="silence-suppressed")
     if last_was_silence:
         return ProgressDecision("skip", reason="silence-already-reported")
     if now - last_at < settings.silence_minutes * 60:
