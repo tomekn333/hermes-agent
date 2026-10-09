@@ -1002,6 +1002,55 @@ class TestFileReadNonReusableRedaction:
         assert "…" in masked
 
 
+class TestStructuredFieldRedaction:
+    """Structured credential fields preserve syntax but never a reusable mask."""
+
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_client_secret_masks_single_and_double_quoted_dicts(self, quote):
+        secret = "opaque-client-secret-value-1234567890"
+        text = f"{{{quote}client_secret{quote}: {quote}{secret}{quote}}}"
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert secret not in out
+        assert f"{quote}client_secret{quote}: {quote}" in out
+        assert out.endswith(f"{quote}}}")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"client_secret": "opaque-client-secret-value-1234567890"}',
+            "client_secret: opaque-client-secret-value-1234567890",
+        ],
+    )
+    def test_strict_structured_fields_use_nonreusable_mask(self, text):
+        secret = "opaque-client-secret-value-1234567890"
+
+        out = redact_sensitive_text(
+            text, force=True, file_read=True, strict_fields=True
+        )
+
+        assert secret not in out
+        assert secret[:6] not in out
+        assert secret[-4:] not in out
+        assert "«redacted-secret»" in out
+
+    def test_public_oauth_client_id_is_not_masked_on_log_or_terminal_output(self):
+        from agent.redact import redact_terminal_output
+
+        client_id = "1234567890-example.apps.googleusercontent.com"
+        text = f'{{"client_id": "{client_id}"}}'
+
+        assert redact_sensitive_text(text, force=True) == text
+        assert redact_terminal_output(text, "python show_oauth.py", force=True) == text
+
+    def test_client_secret_remains_masked_on_non_file_surface(self):
+        secret = "opaque-client-secret-value-1234567890"
+        text = f'{{"client_secret": "{secret}"}}'
+
+        assert secret not in redact_sensitive_text(text, force=True)
+
+
 
 
 

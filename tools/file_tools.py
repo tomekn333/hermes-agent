@@ -654,6 +654,9 @@ def _restricted_profile() -> bool:
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
     """Remove credential/cache/env paths from a SearchResult in-place."""
     omitted = 0
+    # `matches` is only the requested page, whereas `total_count` covers the
+    # complete search. Keep the latter as the source of truth below.
+    original_total_count = getattr(result, "total_count", 0)
 
     if hasattr(result, "matches") and result.matches:
         allowed_matches = []
@@ -677,30 +680,27 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
         allowed_counts = {}
         for file_path, count in result.counts.items():
             if _search_result_read_block_error(file_path, task_id):
-                omitted += 1
+                # Count-mode `total_count` counts matching lines, not files.
+                # Keep `omitted` in that same unit before subtracting it from
+                # the original full count below.
+                omitted += count
                 continue
             allowed_counts[file_path] = count
         result.counts = allowed_counts
 
-    # N1 (HIGH, review 2026-10-09): suppressing the `_omitted` *message* was not
-    # enough — `total_count` is emitted unconditionally by `to_dict()`, so
-    # `total_count - len(matches)` reproduced the exact same oracle and let a
-    # restricted caller binary-search a denied file's content by pattern. For a
-    # restricted profile the response must be indistinguishable from "no match",
-    # so recompute the count from the filtered collections.
+    # Suppressing the `_omitted` message is not enough: count and pagination
+    # metadata are also observable. Use the original full result count (not
+    # the length of the requested page) so legal matches outside this page are
+    # not lost, then remove every pagination signal when a denied result was
+    # filtered. Otherwise a `limit=1, context>0` search can distinguish a
+    # hidden hit from no hit through `truncated`/`limit_reason` alone.
     if omitted and _restricted_profile():
-        if hasattr(result, "counts") and result.counts:
-            total = sum(result.counts.values())
-        elif hasattr(result, "matches") and result.matches is not None:
-            total = len(result.matches)
-        elif hasattr(result, "files") and result.files is not None:
-            total = len(result.files)
-        else:
-            total = 0
         if hasattr(result, "total_count"):
-            result.total_count = total
-        if hasattr(result, "total_count_is_lower_bound"):
-            result.total_count_is_lower_bound = False
+            result.total_count = max(0, original_total_count - omitted)
+        if hasattr(result, "truncated"):
+            result.truncated = False
+        if hasattr(result, "limit_reason"):
+            result.limit_reason = None
 
     return omitted
 
@@ -2759,7 +2759,16 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         result_json = json.dumps(result_dict, ensure_ascii=False)
         # Hint when results were truncated — explicit next offset is clearer
         # than relying on the model to infer it from total_count vs match count.
-        if result_dict.get("truncated"):
+        # A restricted search with no visible result must not expose a hidden
+        # hit through pagination advice. The filter normally clears truncation;
+        # this explicit gate stays fail-closed for future search backends.
+        has_visible_results = any(
+            result_dict.get(key)
+            for key in ("matches", "matches_text", "files", "counts")
+        )
+        if result_dict.get("truncated") and (
+            not _restricted_profile() or has_visible_results
+        ):
             next_offset = offset + limit
             result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
         return result_json

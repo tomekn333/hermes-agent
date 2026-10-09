@@ -372,10 +372,11 @@ def _assignment_value_requires_redaction(key: str, value: str) -> bool:
     """Apply value-aware gating to key-name-only assignment matches."""
     return _key_has_strong_secret_keyword(key) or _looks_like_opaque_credential(value)
 
-# JSON field patterns: "apiKey": "value", "token": "value", etc.
+# JSON/Python-dict field patterns: "apiKey": "value", 'token': 'value', etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|passwd|access_token|refresh_token|auth_token|id_token|bearer|secret_value|raw_secret|secret_input|key_material|client_secret|client_id|private_key|private_key_id|session_key|signing_secret|webhook_secret|app_secret|consumer_secret|encryption_key)"
 _JSON_FIELD_RE = re.compile(
-    rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
+    rf'((?P<key_quote>["\']){_JSON_KEY_NAMES}(?P=key_quote))\s*:\s*'
+    rf'(?P<value_quote>["\'])([^"\']+)(?P=value_quote)',
     re.IGNORECASE,
 )
 
@@ -951,18 +952,32 @@ def redact_sensitive_text(
                 text = _CFG_DOTTED_RE.sub(_redact_env, text)
                 text = _CFG_ANCHORED_RE.sub(_redact_env, text)
 
-        # JSON fields: "apiKey": "***"  (skip for code files — false positives)
-        if ":" in text and '"' in text:
+        # JSON/Python-dict fields: "apiKey": "***" / 'apiKey': '***'.
+        # Skip code files to avoid false positives in ordinary source snippets.
+        if ":" in text and ('"' in text or "'" in text):
             def _redact_json(m):
-                key, value = m.group(1), m.group(2)
+                key, value = m.group(1), m.group(4)
+                key_name = key[1:-1]
                 # Same programmatic-env-lookup exception as _redact_env above
                 # (issue #2852): "apiKey": "os.getenv('X')" is a code snippet,
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
+                # OAuth client IDs identify a public application; they are not
+                # credentials. Keep them visible on ordinary log/transcript
+                # surfaces while retaining strict file-boundary redaction.
+                if key_name.casefold() == "client_id" and not (
+                    file_read or strict_fields
+                ):
+                    return m.group(0)
                 if not _assignment_value_requires_redaction(key, value):
                     return m.group(0)
-                return f'{key}: "{_mask_token(value)}"'
+                quote = m.group("value_quote")
+                mask = (
+                    _mask_token_nonreusable
+                    if file_read or strict_fields else _mask_token
+                )
+                return f"{key}: {quote}{mask(value)}{quote}"
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
@@ -983,7 +998,11 @@ def redact_sensitive_text(
                     return m.group(0)
                 if not _assignment_value_requires_redaction(key, value):
                     return m.group(0)
-                return f"{key}{sep}{_mask_token(value)}"
+                mask = (
+                    _mask_token_nonreusable
+                    if file_read or strict_fields else _mask_token
+                )
+                return f"{key}{sep}{mask(value)}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after

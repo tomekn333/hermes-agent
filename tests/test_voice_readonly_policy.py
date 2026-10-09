@@ -278,6 +278,50 @@ def test_total_count_is_not_an_oracle_on_denied_content(voice_home, tmp_path):
     assert not hit.get("total_count_is_lower_bound")
 
 
+def test_truncation_metadata_is_not_an_oracle_on_denied_content(voice_home, tmp_path):
+    """R3 N1 — pagination must not distinguish a hidden hit from a miss.
+
+    A context search over a one-result page is the reachable form of the
+    oracle: ripgrep fetches extra context, then the response reports its page
+    as truncated even after the denied match itself has been removed.
+    """
+    from tools.file_tools import search_tool
+
+    (tmp_path / "secrets.json").write_text("NEEDLEVALUE\n")
+    hit_raw = search_tool("NEEDLEVALUE", path=str(tmp_path), limit=1, context=1)
+    miss_raw = search_tool(
+        "ZZZNOSUCHPATTERN", path=str(tmp_path), limit=1, context=1
+    )
+
+    assert "[Hint: Results truncated." not in hit_raw
+    hit = json.loads(hit_raw)
+    miss = json.loads(miss_raw)
+    for result in (hit, miss):
+        assert not result.get("truncated")
+        assert not result.get("total_count_is_lower_bound")
+        assert result.get("limit_reason") is None
+    assert set(hit) - {"_warning"} == set(miss) - {"_warning"}
+
+
+def test_filtered_total_uses_full_count_not_page_length(voice_home, tmp_path):
+    """R3 N5 — a filtered page cannot redefine the full result count."""
+    from tools.file_operations import SearchMatch, SearchResult
+    from tools.file_tools import _filter_read_blocked_search_results
+
+    denied_path = tmp_path / "secrets.json"
+    result = SearchResult(
+        matches=[SearchMatch(str(denied_path), 1, "NEEDLEVALUE")],
+        total_count=101,
+        truncated=True,
+        limit_reason="result limit",
+    )
+
+    assert _filter_read_blocked_search_results(result) == 1
+    assert result.total_count == 100
+    assert result.truncated is False
+    assert result.limit_reason is None
+
+
 def test_count_mode_does_not_leak_denied_totals(voice_home, tmp_path):
     """N1 — `count` output mode summed over unfiltered files."""
     from tools.file_tools import search_tool
@@ -316,6 +360,75 @@ def test_restricted_profile_cannot_gate_foreign_child(voice_home, monkeypatch):
     )
     result = json.loads(_handle_link({"parent_id": "t_own", "child_id": "t_foreign"}))
     assert result.get("error")
+
+
+def test_restricted_profile_cannot_link_foreign_parent_to_own_child(voice_home, monkeypatch):
+    """R3 N7 — parent subscriptions must not be inherited cross-task."""
+    from tools.kanban_tools import _handle_link
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_own")
+    monkeypatch.setattr(
+        "tools.kanban_tools._connect",
+        lambda **_kw: (_ for _ in ()).throw(AssertionError("must reject before DB access")),
+    )
+    result = json.loads(_handle_link({"parent_id": "t_foreign", "child_id": "t_own"}))
+    assert result.get("error")
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "args"),
+    [
+        ("_handle_complete", {"task_id": "t_foreign", "summary": "done"}),
+        ("_handle_block", {"task_id": "t_foreign", "reason": "waiting"}),
+        ("_handle_request_review", {"task_id": "t_foreign", "summary": "ready"}),
+        ("_handle_request_changes", {"task_id": "t_foreign", "reason": "fix"}),
+        ("_handle_heartbeat", {"task_id": "t_foreign"}),
+        ("_handle_comment", {"task_id": "t_foreign", "body": "handoff"}),
+        (
+            "_handle_attach",
+            {
+                "task_id": "t_foreign",
+                "filename": "evidence.txt",
+                "content_base64": "eA==",
+            },
+        ),
+        (
+            "_handle_attach_url",
+            {"task_id": "t_foreign", "url": "https://example.test/evidence.txt"},
+        ),
+        ("_handle_unblock", {"task_id": "t_foreign"}),
+        ("_handle_link", {"parent_id": "t_own", "child_id": "t_foreign"}),
+    ],
+)
+@pytest.mark.parametrize("task_env", ["t_own", None])
+def test_restricted_writers_fail_closed_before_database(
+    voice_home, monkeypatch, handler_name, args, task_env
+):
+    """R3 N2 — no writer may become an orchestrator without a task scope."""
+    from tools import kanban_tools as kt
+
+    if task_env is None:
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_env)
+    monkeypatch.setattr(
+        kt,
+        "_connect",
+        lambda **_kw: (_ for _ in ()).throw(AssertionError("must reject before DB access")),
+    )
+
+    result = json.loads(getattr(kt, handler_name)(args))
+    assert result.get("error"), (handler_name, task_env, result)
+
+
+def test_restricted_scope_keeps_normal_profile_orchestrator_behavior(monkeypatch):
+    """R3 N2 — the additional gate is a no-op outside the restricted tier."""
+    from agent import voice_readonly_policy
+    from tools.kanban_tools import _enforce_restricted_task_scope
+
+    monkeypatch.setattr(voice_readonly_policy, "is_voice_readonly_profile", lambda: False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert _enforce_restricted_task_scope("t_any", "kanban_complete") is None
 
 
 @pytest.mark.parametrize("name", ["auth.json~1", "auth.json~", ".env~3",

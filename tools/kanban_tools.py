@@ -797,6 +797,9 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    scope_err = _enforce_restricted_task_scope(tid, "kanban_complete")
+    if scope_err:
+        return scope_err
     gate_err = _push_gate_error()
     if gate_err:
         return gate_err
@@ -970,6 +973,9 @@ def _handle_block(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    scope_err = _enforce_restricted_task_scope(tid, "kanban_block")
+    if scope_err:
+        return scope_err
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
@@ -1051,6 +1057,9 @@ def _handle_request_review(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    scope_err = _enforce_restricted_task_scope(tid, "kanban_request_review")
+    if scope_err:
+        return scope_err
     summary = args.get("summary")
     if not summary or not str(summary).strip():
         return tool_error(
@@ -1135,6 +1144,9 @@ def _handle_request_changes(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    scope_err = _enforce_restricted_task_scope(tid, "kanban_request_changes")
+    if scope_err:
+        return scope_err
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — describe the changes needed")
@@ -1191,6 +1203,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    scope_err = _enforce_restricted_task_scope(tid, "kanban_heartbeat")
+    if scope_err:
+        return scope_err
     note = args.get("note")
     board = args.get("board")
     try:
@@ -1288,6 +1303,9 @@ def _handle_attach(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    scope_err = _enforce_restricted_task_scope(tid, "kanban_attach")
+    if scope_err:
+        return scope_err
     filename = args.get("filename")
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
@@ -1410,6 +1428,9 @@ def _handle_attach_url(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    scope_err = _enforce_restricted_task_scope(tid, "kanban_attach_url")
+    if scope_err:
+        return scope_err
     url = args.get("url")
     if not url or not str(url).strip():
         return tool_error("url is required")
@@ -1789,6 +1810,9 @@ def _handle_unblock(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(str(tid))
     if ownership_err:
         return ownership_err
+    scope_err = _enforce_restricted_task_scope(str(tid), "kanban_unblock")
+    if scope_err:
+        return scope_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1816,12 +1840,13 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
-    # N4 (review 2026-10-09): the earlier `parent_id != own and child_id != own`
-    # guard was bypassable — passing `parent_id=<own>, child_id=<foreign>` hit
-    # neither branch, yet `link_tasks` degrades the foreign card ready→todo and
-    # gates it on ours (plus copies notify subs onto it). That is the same DoS,
-    # just on the other end of the edge. A restricted worker may only add a
-    # dependency TO ITS OWN card, so `child_id` is checked unconditionally.
+    # `link_tasks` mutates the child and copies notification subscriptions from
+    # the parent. Scoping only the child still allowed an outside parent to
+    # donate its subscribers to the worker's card, so both endpoints must be
+    # the dispatched task before any database access.
+    scope_err = _enforce_restricted_task_scope(str(parent_id), "kanban_link")
+    if scope_err:
+        return scope_err
     scope_err = _enforce_restricted_task_scope(str(child_id), "kanban_link")
     if scope_err:
         return scope_err
