@@ -16,6 +16,11 @@ DEFAULT_CODEX_MODELS: List[str] = [
     # GPT-5.6 series (Sol/Terra/Luna). The public API exposes "-pro"
     # variants, but the ChatGPT Codex OAuth backend rejects them with HTTP 400,
     # so the curated offline fallback must not surface those dead choices.
+    # GPT-6 series (lokalny patch 2026-10-09: widoczne w katalogu OAuth po Codex CLI 0.162)
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
