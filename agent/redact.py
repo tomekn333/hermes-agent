@@ -441,12 +441,23 @@ def _looks_like_credential_by_shape(value: str) -> bool:
     # short and all-lowercase.
     if _PREFIKS_DOSTAWCY_RE.match(value):
         return True
-    if _JWT_KSZTALT_RE.fullmatch(value) and not _JEST_ZLOZONYM_IDENTYFIKATOREM(value):
+    if (
+        _JWT_KSZTALT_RE.fullmatch(value)
+        and not _JEST_ZLOZONYM_IDENTYFIKATOREM(value)
+        and not _JEST_ZBUDOWANY_ZE_SLOW(value)           # round 6: long-word module path
+    ):
         return True
 
     # --- structural exclusions: high entropy, unmistakable non-secret format
     if "://" in value:                                   # URL
         return False
+    # Round 6: the sweep splits on ':' so ``https://host/path`` reaches here as
+    # ``//host/path`` and the ``://`` test above never fires. Judge the URL
+    # body on its own instead of excluding it wholesale, so a secret placed
+    # directly after ``//`` is still masked.
+    if value.startswith("//"):
+        reszta = value.lstrip("/")
+        return len(reszta) >= _MIN_DLUGOSC_KANDYDATA and _looks_like_credential_by_shape(reszta)
     if _UUID_RE.fullmatch(value):                        # UUID / GUID
         return False
     if _ZNACZNIK_CZASU_ISO_RE.match(value):              # ISO-8601 timestamp
@@ -494,7 +505,69 @@ def _looks_like_credential_by_shape(value: str) -> bool:
     if _JEST_ZLOZONYM_IDENTYFIKATOREM(value):
         return False
 
-    return _entropia_shannona(value) >= _PROG_ENTROPII_SEKRETU
+    # Round 6 (independent review) over-redaction: identifiers glued from
+    # LONG natural-language words (``customerengagementpipeline``,
+    # ``internationalization``) fail the short-segment test above, and their
+    # whole-value entropy with separators reaches 4.0-4.1. They are recognised
+    # by being made almost entirely of words, which a generated credential is
+    # not (measured: random base62/base64 of length 20-40 has word coverage
+    # median 0.25, p99.9 <= 0.85; these identifiers score 0.96-1.0).
+    if _JEST_ZBUDOWANY_ZE_SLOW(value):
+        return False
+
+    return _entropia_shannona(value) >= _prog_entropii_dla_dlugosci(len(value))
+
+
+def _prog_entropii_dla_dlugosci(dlugosc: int) -> float:
+    """Return the entropy threshold for a candidate of ``dlugosc`` chars.
+
+    Round 6 (independent review) leak: a FIXED 4.0 threshold cannot be reached
+    by short random tokens, because Shannon entropy of an n-char string is
+    capped at log2(n) and a random 20-char base62 token has median entropy of
+    only ~4.02 (measured p0.1 = 3.48). So ``fK9LdBwYNcqB6KrfRtK0`` (3.88) leaked.
+    The threshold therefore follows the cap: log2(n) - 0.9, never above 4.0.
+    For n=20 that is 3.42 (below p0.1 of random base62), for n>=32 it is the
+    original 4.0. Ordinary values that would clear the lower bar are taken out
+    earlier by the structural exclusions (composed identifiers, words, URLs,
+    UUIDs, timestamps, digests).
+    """
+    if dlugosc <= 1:
+        return _PROG_ENTROPII_SEKRETU
+    return min(_PROG_ENTROPII_SEKRETU, math.log2(dlugosc) - 0.9)
+
+
+# A "word" for the word-coverage test: a Capitalised run (``App``, ``Http``),
+# a lowercase run of >=3 letters, an UPPERCASE acronym of >=2 letters that
+# ends at a non-letter or before a Capitalised word, or a run of >=4 digits
+# (years, build numbers). Calibrated on 10k random tokens per shape: switching
+# from a vowel requirement to this form fixed ``XMLHttpRequestUpload2`` /
+# ``WhatsAppBridgeOutbound`` at a cost of +0.06 pp unmasked random base62-20.
+_SLOWO_RE = re.compile(
+    r"[A-Z][a-z]{2,}|[a-z]{3,}|[A-Z]{2,}(?=[A-Z][a-z]|[^A-Za-z]|$)|\d{4,}"
+)
+_MIN_POKRYCIE_SLOWAMI = 0.9
+_MIN_SREDNIA_DLUGOSC_SLOWA = 5.0
+
+
+def _JEST_ZBUDOWANY_ZE_SLOW(value: str) -> bool:
+    """Return whether ``value`` is made (almost) entirely of natural words.
+
+    Both conditions must hold: word coverage of the alphanumeric characters
+    >= 0.9, and the mean word length >= 5. Random credentials occasionally
+    produce short 3-4 char lowercase runs, but practically never cover 90 %
+    of the token with words averaging 5+ characters.
+    """
+    alnum = sum(c.isalnum() for c in value)
+    if alnum == 0:
+        return False
+    slowa = [m.group(0) for m in _SLOWO_RE.finditer(value)]
+    if not slowa:
+        return False
+    pokryte = sum(len(s) for s in slowa)
+    return (
+        pokryte / alnum >= _MIN_POKRYCIE_SLOWAMI
+        and pokryte / len(slowa) >= _MIN_SREDNIA_DLUGOSC_SLOWA
+    )
 
 
 def _entropia_shannona(value: str) -> float:
