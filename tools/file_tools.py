@@ -613,7 +613,12 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
         resolved = _resolve_path_for_task(path, task_id)
     except (OSError, ValueError, RuntimeError):
         return get_read_block_error(path)
-    return get_read_block_error(str(resolved))
+    shared_error = get_read_block_error(str(resolved))
+    if shared_error:
+        return shared_error
+    from agent.voice_readonly_policy import read_path_denial
+
+    return read_path_denial(str(resolved))
 
 
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
@@ -1657,6 +1662,8 @@ def _special_file_kind(path) -> str | None:
 def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
+        from agent.voice_readonly_policy import read_path_denial
+
         offset, limit = normalize_read_pagination(offset, limit)
 
         # ── Device path guard ─────────────────────────────────────────
@@ -1670,6 +1677,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         _resolved = _resolve_path_for_task(path, task_id)
+        denial = read_path_denial(str(_resolved))
+        if denial:
+            return tool_error(denial)
 
         # ── Special-file type guard (stat-based) ──────────────────────
         # The name blocklist above catches /dev/* and /proc/* aliases; this
@@ -2591,6 +2601,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
+        from agent.voice_readonly_policy import read_path_denial
+
+        try:
+            policy_path = _resolve_path_for_task(path, task_id)
+        except (OSError, ValueError, RuntimeError):
+            policy_path = path
+        denial = read_path_denial(str(policy_path), search=True)
+        if denial:
+            return tool_error(denial)
         offset, limit = normalize_search_pagination(offset, limit)
 
         # Track searches to detect *consecutive* repeated search loops.

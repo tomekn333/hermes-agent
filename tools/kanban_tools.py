@@ -1461,6 +1461,13 @@ def _handle_create(args: dict, **kw) -> str:
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
+    from agent.voice_readonly_policy import is_voice_readonly_profile
+
+    if is_voice_readonly_profile():
+        return tool_error(
+            "kanban_create is unavailable to the voice-readonly profile: "
+            "creating a child with a privileged assignee would bypass its sandbox"
+        )
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
