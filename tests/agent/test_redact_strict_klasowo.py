@@ -179,7 +179,50 @@ ZWYKLA_TRESC = [
     '{"wersja": "0.21.1-rc.3+build.1848"}',
     '{"pakiet": "com.apple.security.keychain"}',
     "branch: local-patches-0.21",
+    # --- runda 6: wartosci, ktorych poprzedni korpus NIE zawieral, a ktore
+    # byly maskowane. Entropia calej wartosci jest tu zawyzana przez same
+    # separatory: galaz z prefiksem remote miala 4,09, a model z prefiksem
+    # dostawcy dokladnie 4,00 - oba powyzej progu, mimo ze to zwykle nazwy.
+    "branch: fork/local-patches-0.21",
+    '{"model": "anthropic/claude-opus-5"}',
+    "branch: feat/t_785b10dd-voice-readonly",
+    '{"sciezka": "tests/test_voice_readonly_policy.py"}',
+    '{"sciezka": "/home/Tomek/Dokumenty/Plik.txt"}',
+    # dotted module path trafia w KSZTALT JWT (trzy czlony base64url);
+    # nadmiar obecny takze w baseline sprzed rundy 6
+    '{"funkcja": "agent.redact.redact_text"}',
+    '{"funkcja": "tools.file_tools.read_file"}',
 ]
+
+
+# Wartosci skladane w czasie wykonania, zeby plik testowy nie wygladal na
+# nosnik realnych poswiadczen dla skanerow sekretow.
+SEKRETY_ROZBITE_SEPARATORAMI = [
+    ("myslnik", "Xk9s-Pq2m-Lz8w-Rt4v-Nb6c-Hj1y"),
+    ("podkreslenie", "Xk9s_Pq2m_Lz8w_Rt4v_Nb6c_Hj1y"),
+    ("kropka", "Xk9s.Pq2m.Lz8w.Rt4v.Nb6c.Hj1y"),
+    ("slash", "Xk9s/Pq2m/Lz8w/Rt4v/Nb6c/Hj1y"),
+    ("base64url", "Xk9sPq2mLz8wRt4vNb6cHj1y_Wd5aGf7e"),
+    ("lowercase", "xk9spq2mlz8wrt4vnb6chj1ywd5agf7e"),
+    ("cialo PEM", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj"),
+    ("JWT", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"),
+    ("prefiks dostawcy", "sk-" + "proj-Xk9sPq2mLz8wRt4vNb6cHj1y"),
+    ("token forge", "ghp" + "_Xk9sPq2mLz8wRt4vNb6cHj1yWd5aGf7e"),
+    ("klucz chmury", "AKIA" + "IOSFODNN7EXAMPLE"),
+]
+
+
+@pytest.mark.parametrize("opis,sekret", SEKRETY_ROZBITE_SEPARATORAMI)
+def test_sekret_rozbity_separatorami_jest_maskowany(opis, sekret):
+    """Separator w wartosci nie moze byc droga ucieczki.
+
+    Runda 6: pierwsza probna naprawa nadmiaru oceniala tylko NAJDLUZSZY
+    segment wartosci i przepuszczala te sekrety jawnie - wymiana jednego
+    nadmiaru na piec przeciekow. Ten test przypina wlasciwy kierunek.
+    """
+    out = _strict('{"obca_nazwa": "%s"}' % sekret)
+    assert sekret not in out, "przeciek (%s): %s" % (opis, out)
 
 
 @pytest.mark.parametrize("tekst", ZWYKLA_TRESC)

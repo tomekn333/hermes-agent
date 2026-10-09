@@ -433,7 +433,15 @@ def _looks_like_credential_by_shape(value: str) -> bool:
         return False
 
     # Vendor-prefixed credentials and JWTs are certain regardless of entropy.
-    if _PREFIKS_DOSTAWCY_RE.match(value) or _JWT_KSZTALT_RE.fullmatch(value):
+    # The JWT shape (three dot-separated base64url runs) also matches an
+    # ordinary dotted Python path such as ``agent.redact.redact_text`` — a
+    # pre-existing over-redaction found by the round-6 audit, present in the
+    # baseline too. The composed-identifier test separates them without a new
+    # list: a real JWT's segments are long and mixed-case, a module path's are
+    # short and all-lowercase.
+    if _PREFIKS_DOSTAWCY_RE.match(value):
+        return True
+    if _JWT_KSZTALT_RE.fullmatch(value) and not _JEST_ZLOZONYM_IDENTYFIKATOREM(value):
         return True
 
     # --- structural exclusions: high entropy, unmistakable non-secret format
@@ -455,10 +463,35 @@ def _looks_like_credential_by_shape(value: str) -> bool:
     # this boundary — this sweep is the second layer, not the only one.
     if _HEX_RE.fullmatch(value):
         return len(value) not in (32, 40, 64, 128)
-    if value.count("/") >= 2:                            # filesystem path
-        return False
+    if value.count("/") >= 2 and _JEST_ZLOZONYM_IDENTYFIKATOREM(value):
+        return False                                     # filesystem path
     # Dotted hostname / dotted identifier (api.example.com, com.apple.foo).
-    if value.count(".") >= 2 and not _JWT_KSZTALT_RE.fullmatch(value):
+    if (
+        value.count(".") >= 2
+        and not _JWT_KSZTALT_RE.fullmatch(value)
+        and _JEST_ZLOZONYM_IDENTYFIKATOREM(value)
+    ):
+        return False
+
+    # Composed human identifier: branch name, provider-qualified model name,
+    # image tag. Round 6 audit: whole-value entropy is INFLATED by the
+    # punctuation that merely glues such a name together, so
+    # ``fork/local-patches-0.21`` scored 4.09 and ``anthropic/claude-opus-5``
+    # 4.00 and both were being masked — the round-5 corpus missed this because
+    # it tested only the bare ``local-patches-0.21`` form, without the remote
+    # prefix. Judging the longest segment instead was tried and REJECTED: it
+    # let five separator-split secrets through (measured), trading one
+    # over-redaction for five leaks.
+    #
+    # The exclusion is therefore kept deliberately narrow — it fires only on
+    # the shape that human identifiers actually have and that generated
+    # credentials do not: every segment short and all-lowercase. A secret keeps
+    # mixed case or a long run, so it misses this branch and is still judged on
+    # entropy below. Residual risk, accepted on the same grounds as the hex
+    # digest case: an all-lowercase secret chopped into <=12-char groups is not
+    # masked by this second layer; the denylist in voice_readonly_policy is the
+    # first layer that keeps secret-bearing files unreachable here.
+    if _JEST_ZLOZONYM_IDENTYFIKATOREM(value):
         return False
 
     return _entropia_shannona(value) >= _PROG_ENTROPII_SEKRETU
@@ -473,6 +506,54 @@ def _entropia_shannona(value: str) -> float:
     return -sum(
         (n / dlugosc) * math.log2(n / dlugosc) for n in licznik.values()
     )
+
+
+# Separators that COMPOSE human identifiers (branch names, model names, image
+# tags, versions, paths). One readable segment is short and uses at most two of
+# the three character classes (lower / upper / digit): ``README``, ``claude``,
+# ``Plik``, ``785b10dd`` qualify, while a generated run like ``Xk9s`` mixes all
+# three in four characters. Round 6 measured that whole-value entropy CANNOT
+# make this distinction — a URL path scored 4.41 and a separator-split secret
+# 4.46 — so the gate is the per-segment shape, not the average.
+_SEPARATORY_ZLOZENIA_RE = re.compile(r"[/._\-+~]+")
+_MAX_DLUGOSC_SEGMENTU_CZYTELNEGO = 16
+
+
+def _JEST_ZLOZONYM_IDENTYFIKATOREM(value: str) -> bool:
+    """Return whether ``value`` has the shape of a composed human identifier.
+
+    Rationale and the measured trade-off are documented at the call site in
+    _looks_like_credential_by_shape.
+    """
+    segmenty = [s for s in _SEPARATORY_ZLOZENIA_RE.split(value) if s]
+    if len(segmenty) < 2:
+        return False
+    for segment in segmenty:
+        if len(segment) > _MAX_DLUGOSC_SEGMENTU_CZYTELNEGO:
+            return False
+        klasy = (
+            any(c.islower() for c in segment),
+            any(c.isupper() for c in segment),
+            any(c.isdigit() for c in segment),
+        )
+        if sum(klasy) > 2:
+            return False
+        if not all(c.isalnum() for c in segment):
+            return False
+    return True
+
+
+def _entropia_najdluzszego_segmentu(value: str) -> float:
+    """Return the entropy of the longest separator-free segment of ``value``.
+
+    Kept as a diagnostic helper for the strict-boundary corpus tests; the
+    credential gate deliberately does NOT use it (see the call site: judging
+    only the longest segment leaked separator-split secrets).
+    """
+    segmenty = [s for s in _SEPARATORY_ZLOZENIA_RE.split(value) if s]
+    if not segmenty:
+        return 0.0
+    return _entropia_shannona(max(segmenty, key=len))
 
 
 # Candidate runs for the strict-boundary sweep: maximal spans of characters
