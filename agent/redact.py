@@ -372,12 +372,65 @@ def _assignment_value_requires_redaction(key: str, value: str) -> bool:
     """Apply value-aware gating to key-name-only assignment matches."""
     return _key_has_strong_secret_keyword(key) or _looks_like_opaque_credential(value)
 
+
+def _looks_like_credential_by_shape(value: str) -> bool:
+    """Return whether ``value`` has credential shape, ignoring its key name.
+
+    Used only on strict security boundaries (``strict_fields=True``) where a
+    secret must never be returned even under a key name nobody enumerated.
+    Deliberately NARROWER than :func:`_looks_like_opaque_credential`: it
+    requires a single whitespace-free opaque run, so ordinary prose values
+    (``"description": "Backup of the prod database"``) and short technical
+    scalars (``"model": "opus"``, ``"port": "8642"``) pass through unchanged
+    and the file stays readable.
+    """
+    if value == "***" or value.startswith("«redacted"):
+        return False
+    if any(c.isspace() for c in value):
+        return False
+    # Long hex blobs: digests, raw keys, hashed credentials.
+    if len(value) >= 16 and re.fullmatch(r"[A-Fa-f0-9]+", value):
+        return True
+    # Opaque high-entropy run in the character class real credentials use.
+    if len(value) >= 20 and re.fullmatch(r"[A-Za-z0-9_./+=:~-]+", value):
+        classes = sum(
+            bool(re.search(pattern, value))
+            for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]")
+        )
+        # A single-class run of that length is a path, hostname, or an id-like
+        # slug far more often than a secret; require mixed case/digits.
+        return classes >= 2
+    return False
+
 # JSON/Python-dict field patterns: "apiKey": "value", 'token': 'value', etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|passwd|access_token|refresh_token|auth_token|id_token|bearer|secret_value|raw_secret|secret_input|key_material|client_secret|client_id|private_key|private_key_id|session_key|signing_secret|webhook_secret|app_secret|consumer_secret|encryption_key)"
 _JSON_FIELD_RE = re.compile(
     rf'((?P<key_quote>["\']){_JSON_KEY_NAMES}(?P=key_quote))\s*:\s*'
     rf'(?P<value_quote>["\'])([^"\']+)(?P=value_quote)',
     re.IGNORECASE,
+)
+
+# Key-name-AGNOSTIC quoted field: ANY quoted key with a quoted value. Used ONLY
+# on strict security boundaries (``strict_fields=True``, i.e. the voice-readonly
+# file-read path), where the gate must be the VALUE's shape, not the key's name.
+#
+# Why this exists: _JSON_KEY_NAMES above is an enumeration, and every review
+# round found another real-world credential key missing from it (``refresh_token``
+# in round 1, ``client_secret`` in round 2, ``session_token`` and arbitrary
+# vendor-specific names in round 4). An enumeration can only ever be patched one
+# name at a time, so on a boundary that must never return a secret we invert the
+# test: any field whose value LOOKS like an opaque credential gets masked,
+# whatever the key is called. Ordinary profiles keep the name-anchored pattern,
+# so normal logs/transcripts are unaffected by the broader rule.
+_ANY_JSON_FIELD_RE = re.compile(
+    r'((?P<key_quote>["\'])[A-Za-z0-9_.\-]{1,64}(?P=key_quote))\s*:\s*'
+    r'(?P<value_quote>["\'])([^"\']+)(?P=value_quote)',
+)
+
+# Key-name-agnostic unquoted YAML/colon assignment, same rationale as above.
+_ANY_YAML_ASSIGN_RE = re.compile(
+    r"(^[ \t]*+[A-Za-z0-9_.\-]{1,64})(:[ \t]*+)(?!['\"])([^\s&]++)",
+    re.MULTILINE,
 )
 
 # Authorization headers — any scheme (Bearer, Basic, Token, Digest, …) plus the
@@ -980,6 +1033,21 @@ def redact_sensitive_text(
                 return f"{key}: {quote}{mask(value)}{quote}"
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
+            # Strict boundary: repeat the pass WITHOUT the key-name enumeration.
+            # Three review rounds each found another credential key missing from
+            # _JSON_KEY_NAMES, so here the gate is the value's shape only.
+            if strict_fields:
+                def _redact_json_any(m):
+                    value = m.group(4)
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    if not _looks_like_credential_by_shape(value):
+                        return m.group(0)
+                    key = m.group(1)
+                    quote = m.group("value_quote")
+                    return f"{key}: {quote}{_mask_token_nonreusable(value)}{quote}"
+                text = _ANY_JSON_FIELD_RE.sub(_redact_json_any, text)
+
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
         # quotes). Skip URLs — web-URL query params pass through by design.
@@ -1004,6 +1072,18 @@ def redact_sensitive_text(
                 )
                 return f"{key}{sep}{mask(value)}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
+
+            # Strict boundary: key-name-agnostic unquoted pass (see the JSON
+            # counterpart above for the rationale).
+            if strict_fields:
+                def _redact_yaml_any(m):
+                    value = m.group(3)
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    if not _looks_like_credential_by_shape(value):
+                        return m.group(0)
+                    return f"{m.group(1)}{m.group(2)}{_mask_token_nonreusable(value)}"
+                text = _ANY_YAML_ASSIGN_RE.sub(_redact_yaml_any, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
