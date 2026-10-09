@@ -254,3 +254,92 @@ def test_file_content_redaction_survives_global_redaction_switch(voice_home, tmp
     text = json.dumps({"refresh_token": secret, "note": "ok"})
     out = _redact_file_content(text)
     assert secret not in out
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review findings (2026-10-09)
+# ---------------------------------------------------------------------------
+
+
+def test_total_count_is_not_an_oracle_on_denied_content(voice_home, tmp_path):
+    """N1 (HIGH) — hiding `_omitted` left `total_count` leaking the same bit.
+
+    `total_count - len(matches)` reproduced the counter exactly, so a pattern
+    binary-search over a denied file still worked.
+    """
+    from tools.file_tools import search_tool
+
+    secret = tmp_path / "secrets.json"
+    secret.write_text("NEEDLEVALUE\nNEEDLEVALUE\n")
+
+    hit = json.loads(search_tool("NEEDLEVALUE", path=str(tmp_path), limit=20))
+    miss = json.loads(search_tool("ZZZNOSUCHPATTERN", path=str(tmp_path), limit=20))
+    assert hit.get("total_count", 0) == miss.get("total_count", 0) == 0
+    assert not hit.get("total_count_is_lower_bound")
+
+
+def test_count_mode_does_not_leak_denied_totals(voice_home, tmp_path):
+    """N1 — `count` output mode summed over unfiltered files."""
+    from tools.file_tools import search_tool
+
+    (tmp_path / "secrets.json").write_text("NEEDLEVALUE\nNEEDLEVALUE\n")
+    out = json.loads(
+        search_tool("NEEDLEVALUE", path=str(tmp_path), output_mode="count", limit=20)
+    )
+    assert out.get("total_count", 0) == 0
+    assert not out.get("counts")
+
+
+def test_json_client_secret_is_redacted(voice_home):
+    """N2 — `"client_secret"` is exactly the shape Google's auth.json uses."""
+    from tools.file_tools import _redact_file_content
+
+    for key in ("client_secret", "client_id", "private_key_id",
+                "signing_secret", "webhook_secret", "session_key"):
+        secret = "GOCSPX-" + "b" * 40
+        out = _redact_file_content(json.dumps({key: secret}))
+        assert secret not in out, key
+
+
+def test_restricted_profile_cannot_gate_foreign_child(voice_home, monkeypatch):
+    """N4 — `parent_id=own, child_id=foreign` slipped past the `and` guard.
+
+    link_tasks degrades the foreign card ready→todo and gates it on ours, so
+    the check has to be unconditional on `child_id`.
+    """
+    from tools.kanban_tools import _handle_link
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_own")
+    monkeypatch.setattr(
+        "tools.kanban_tools._connect",
+        lambda **_kw: (_ for _ in ()).throw(AssertionError("must reject before DB access")),
+    )
+    result = json.loads(_handle_link({"parent_id": "t_own", "child_id": "t_foreign"}))
+    assert result.get("error")
+
+
+@pytest.mark.parametrize("name", ["auth.json~1", "auth.json~", ".env~3",
+                                  "id_rsa~12", "auth.json.~1~"])
+def test_tilde_numeric_backup_tails_denied(voice_home, tmp_path, name):
+    """N5 — `~<digits>` was not part of the backup-tail alternation."""
+    from agent.voice_readonly_policy import read_path_denial
+
+    assert read_path_denial(tmp_path / name), name
+
+
+def test_kanban_create_import_failure_is_controlled(voice_home, monkeypatch):
+    """N7 — an ImportError must be a tool_error, not a raw traceback."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def boom(name, *a, **kw):
+        if name == "agent.voice_readonly_policy":
+            raise ImportError("simulated")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", boom)
+    from tools.kanban_tools import _handle_create
+
+    result = json.loads(_handle_create({"title": "x", "assignee": "default"}))
+    assert result.get("error")

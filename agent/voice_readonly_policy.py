@@ -62,7 +62,7 @@ _BACKUP_TAIL = re.compile(
     r"[._-](?:back|backup|bak|orig|origin|save|saved|old|older|copy|prev|"
     r"previous|applied|rej|tmp|temp|swp|dist|sample|example|disabled|"
     r"before|after|snapshot|snap|rollback|v\d+)"
-    r"|~"
+    r"|~\d*"                            # N5: `auth.json~`, `auth.json~1`
     r"|[._-]\d{4,}"                     # timestamps / epoch-ish suffixes
     r"|[._-]\d{8}_\d{6}"
     r")+$",

@@ -373,7 +373,7 @@ def _assignment_value_requires_redaction(key: str, value: str) -> bool:
     return _key_has_strong_secret_keyword(key) or _looks_like_opaque_credential(value)
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|passwd|access_token|refresh_token|auth_token|id_token|bearer|secret_value|raw_secret|secret_input|key_material|client_secret|client_id|private_key|private_key_id|session_key|signing_secret|webhook_secret|app_secret|consumer_secret|encryption_key)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
     re.IGNORECASE,

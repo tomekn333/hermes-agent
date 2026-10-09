@@ -641,6 +641,16 @@ def _redact_file_content(text: str) -> str:
     )
 
 
+def _restricted_profile() -> bool:
+    """True when the security-restricted profile is active (fail-closed)."""
+    try:
+        from agent.voice_readonly_policy import is_voice_readonly_profile
+
+        return is_voice_readonly_profile()
+    except Exception:
+        return True
+
+
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
     """Remove credential/cache/env paths from a SearchResult in-place."""
     omitted = 0
@@ -671,6 +681,26 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
                 continue
             allowed_counts[file_path] = count
         result.counts = allowed_counts
+
+    # N1 (HIGH, review 2026-10-09): suppressing the `_omitted` *message* was not
+    # enough — `total_count` is emitted unconditionally by `to_dict()`, so
+    # `total_count - len(matches)` reproduced the exact same oracle and let a
+    # restricted caller binary-search a denied file's content by pattern. For a
+    # restricted profile the response must be indistinguishable from "no match",
+    # so recompute the count from the filtered collections.
+    if omitted and _restricted_profile():
+        if hasattr(result, "counts") and result.counts:
+            total = sum(result.counts.values())
+        elif hasattr(result, "matches") and result.matches is not None:
+            total = len(result.matches)
+        elif hasattr(result, "files") and result.files is not None:
+            total = len(result.files)
+        else:
+            total = 0
+        if hasattr(result, "total_count"):
+            result.total_count = total
+        if hasattr(result, "total_count_is_lower_bound"):
+            result.total_count_is_lower_bound = False
 
     return omitted
 

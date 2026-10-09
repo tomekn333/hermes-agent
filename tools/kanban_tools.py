@@ -1498,9 +1498,16 @@ def _handle_create(args: dict, **kw) -> str:
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
-    from agent.voice_readonly_policy import is_voice_readonly_profile
+    # N7: keep the import consistent with the rest of the boundary — an
+    # ImportError must surface as a controlled tool_error (still fail-closed),
+    # not as an unhandled traceback.
+    try:
+        from agent.voice_readonly_policy import is_voice_readonly_profile
 
-    if is_voice_readonly_profile():
+        restricted = is_voice_readonly_profile()
+    except Exception:
+        restricted = True
+    if restricted:
         return tool_error(
             "kanban_create is unavailable to the voice-readonly profile: "
             "creating a child with a privileged assignee would bypass its sandbox"
@@ -1809,15 +1816,15 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
-    # A restricted worker may only wire edges touching its own card: an
-    # arbitrary parent→child edge can gate (indefinitely block) a foreign
-    # card, which is a board-level denial of service.
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
-    own = str(env_tid) if env_tid else ""
-    if str(parent_id) != own and str(child_id) != own:
-        scope_err = _enforce_restricted_task_scope(str(child_id), "kanban_link")
-        if scope_err:
-            return scope_err
+    # N4 (review 2026-10-09): the earlier `parent_id != own and child_id != own`
+    # guard was bypassable — passing `parent_id=<own>, child_id=<foreign>` hit
+    # neither branch, yet `link_tasks` degrades the foreign card ready→todo and
+    # gates it on ours (plus copies notify subs onto it). That is the same DoS,
+    # just on the other end of the edge. A restricted worker may only add a
+    # dependency TO ITS OWN card, so `child_id` is checked unconditionally.
+    scope_err = _enforce_restricted_task_scope(str(child_id), "kanban_link")
+    if scope_err:
+        return scope_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
