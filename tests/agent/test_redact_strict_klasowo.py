@@ -16,7 +16,7 @@ import pytest
 from agent import redact
 
 SEKRET = "ya29.A0ARrdaM9xQvK3LmNpQrStUvWxYz0123456789abcdefGHIJKLMNOP"
-HEX = "deadbeefcafe0123456789abcdef4242"
+HEX = "deadbeefcafe0123456789abcdef4242"  # dlugosc digestu - patrz test kompromisu
 
 
 def _strict(text: str) -> str:
@@ -64,9 +64,79 @@ def test_sekret_w_zapisie_jednocudzyslowowym():
     assert SEKRET not in out
 
 
-def test_hex_blob_pod_nieznana_nazwa_jest_maskowany():
-    out = _strict('{"odcisk_czegos": "%s"}' % HEX)
-    assert HEX not in out
+def test_hex_blob_nietypowej_dlugosci_jest_maskowany():
+    """Hex o dlugosci innej niz digest = material klucza, nie suma kontrolna."""
+    hex36 = "deadbeefcafe0123456789abcdef42424242"
+    out = _strict('{"odcisk_czegos": "%s"}' % hex36)
+    assert hex36 not in out
+
+
+def test_digesty_pozostaja_czytelne_SWIADOMY_KOMPROMIS():
+    """Git SHA i sumy kontrolne NIE sa maskowane - decyzja, nie przeoczenie.
+
+    Entropia Shannona czystego hexa nie przekracza 4,0 bita/znak (alfabet
+    16-znakowy), wiec hex nigdy nie przejdzie progu entropijnego. Osobna
+    galaz w _looks_like_credential_by_shape maskuje hex KAZDEJ innej dlugosci,
+    ale dlugosci digestow (32/40/64/128) zostawia czytelne, bo runda 5 review
+    wykazala, ze maskowanie wszystkich SHA i sum kontrolnych czyni narzedzie
+    czytania plikow bezuzytecznym.
+
+    RYZYKO RESZTKOWE: sekret bedacy czystym hexem o dlugosci dokladnie
+    32/40/64/128 znakow nie zostanie tu zamaskowany. Jest to akceptowane,
+    bo pierwsza warstwa obrony (denylista w voice_readonly_policy) czyni pliki
+    z sekretami nieosiagalnymi na tej granicy - ten skan jest warstwa druga.
+    Ten test istnieje, zeby kompromis byl jawny i swiadomie zmieniany, a nie
+    odkrywany w kolejnej rundzie review.
+    """
+    sha = "d8488a98ee6bb8c3dfe131977f0e2addc5c622eb"
+    assert _strict("commit: %s" % sha) == "commit: %s" % sha
+    md5 = "5d41402abc4b2a76b9719d911017c592"
+    assert _strict("md5: %s" % md5) == "md5: %s" % md5
+
+
+# ------------------------------------------------- korpus skladni (runda 5)
+# Runda 5 review wykazala, ze naprawa oparta na dopasowaniu SKLADNI (pole JSON
+# w cudzyslowach + przypisanie YAML) jest tym samym bledem co enumeracja nazw
+# kluczy, tylko o poziom wyzej: TOML, ENV, listy YAML, tablice JSON, XML i CSV
+# nie byly pokryte. Ten korpus pilnuje, zeby skan byl niezalezny od skladni.
+SKLADNIE = {
+    "TOML": 'obca = "%s"' % SEKRET,
+    "ENV": "OBCA=%s" % SEKRET,
+    "lista_YAML": "klucze:\n  - %s\n" % SEKRET,
+    "tablica_JSON": '{"dane": ["%s"]}' % SEKRET,
+    "klucz_ze_spacja": '{"obcy klucz": "%s"}' % SEKRET,
+    "klucz_ponad_64_znaki": '{"%s": "%s"}' % ("k" * 70, SEKRET),
+    "wartosc_z_wiodaca_spacja": '{"obca": " %s"}' % SEKRET,
+    "klucz_bez_cudzyslowow": "{obca: %s}" % SEKRET,
+    "CSV_goly": "id,wartosc\n1,%s\n" % SEKRET,
+    "XML": "<obca>%s</obca>" % SEKRET,
+    "URL_query": "https://api.example.com/v1?access_token=%s" % SEKRET,
+    "INI_z_sekcja": "[sekcja]\nobca = %s\n" % SEKRET,
+    "w_nawiasach": "wartosc(%s)" % SEKRET,
+    "po_przecinku": "a,%s,b" % SEKRET,
+    "w_pipe": "a|%s|b" % SEKRET,
+}
+
+
+@pytest.mark.parametrize("nazwa", sorted(SKLADNIE))
+def test_sekret_maskowany_w_kazdej_skladni(nazwa):
+    out = _strict(SKLADNIE[nazwa])
+    assert SEKRET not in out, "LEAK w skladni %s: %s" % (nazwa, out)
+
+
+# Runda 5: jedna linia z "://" gdziekolwiek w pliku wylaczala CALY tor YAML,
+# w tym maskowanie nazw z enumeracji. Skan tokenowy nie ma takiego warunku.
+URL_W_PLIKU = {
+    "URL_przed_sekretem": "endpoint: https://api.example.com/v1\nobca: %s\n" % SEKRET,
+    "URL_i_znana_nazwa": "endpoint: https://api.example.com/v1\napi_key: %s\n" % SEKRET,
+    "URL_w_komentarzu": "# patrz https://x.example/y\nobca: %s\n" % SEKRET,
+}
+
+
+@pytest.mark.parametrize("nazwa", sorted(URL_W_PLIKU))
+def test_url_w_pliku_nie_wylacza_redakcji(nazwa):
+    out = _strict(URL_W_PLIKU[nazwa])
+    assert SEKRET not in out, "LEAK (kill-switch ://) w %s: %s" % (nazwa, out)
 
 
 def test_nazwy_z_enumeracji_nadal_maskowane():
@@ -95,6 +165,20 @@ ZWYKLA_TRESC = [
     '{"sciezka": "/home/tomek/scripts/voice_bridge.py"}',
     '{"data": "2026-10-09"}',
     '{"komentarz": "to jest zwykly tekst a nie sekret"}',
+    # --- dokladnie te wartosci runda 5 wykazala jako nadmiernie maskowane
+    "commit: d8488a98ee6bb8c3dfe131977f0e2addc5c622eb",
+    "Repo: /home/tomek/.hermes/hermes-agent-0.21",
+    '{"uuid": "550e8400-e29b-41d4-a716-446655440000"}',
+    '{"url": "https://github.com/anthropics/claude-code/blob/main/README.md"}',
+    '{"data": "2026-10-09T16:28:06+02:00"}',
+    '{"model": "claude-opus-5-20260101"}',
+    "docker_image: ghcr.io/nousresearch/hermes-agent:sha-9f3a1c2",
+    '{"host": "api.openai.example.com"}',
+    "md5: 5d41402abc4b2a76b9719d911017c592",
+    "sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    '{"wersja": "0.21.1-rc.3+build.1848"}',
+    '{"pakiet": "com.apple.security.keychain"}',
+    "branch: local-patches-0.21",
 ]
 
 

@@ -8,10 +8,12 @@ the first 6 and last 4 characters for debuggability.
 """
 
 import logging
+import math
 import os
 import re
 import shlex
 import threading
+from collections import Counter
 from urllib.parse import unquote_plus
 
 # Basenames treated as ``.env`` files by _command_reads_env_file. Imported
@@ -373,34 +375,131 @@ def _assignment_value_requires_redaction(key: str, value: str) -> bool:
     return _key_has_strong_secret_keyword(key) or _looks_like_opaque_credential(value)
 
 
+# Minimum candidate length on the strict boundary. Shorter values cannot hold
+# enough entropy to be a credential, and masking them destroys ordinary short
+# scalars (``"model": "opus"``, ``"port": "8642"``).
+_MIN_DLUGOSC_KANDYDATA = 20
+
+# Shannon entropy threshold in bits per character. Calibrated on the round-5
+# review corpus: real credentials (OAuth tokens, vendor keys, random secrets)
+# score above it; git SHAs, UUIDs, ISO timestamps, dotted hostnames, paths,
+# model names and Docker image tags score below. See
+# tests/agent/test_redact_strict_klasowo.py for the corpus that pins this value.
+_PROG_ENTROPII_SEKRETU = 4.0
+
+# Vendor-prefixed credentials: certain regardless of entropy, because the
+# prefix itself is the proof.
+_PREFIKS_DOSTAWCY_RE = re.compile(
+    r"(?:ya29\.|sk-|pk-|rk_|gh[pousr]_|xox[abposr]-|AKIA|ASIA|AIza|"
+    r"glpat-|dop_v1_|shpat_|sq0atp-|EAAC|npm_|pypi-|hf_|r8_|"
+    r"nvapi-|sk_live_|sk_test_|rk_live_|whsec_)",
+    re.IGNORECASE,
+)
+
+# JWT: three dot-separated base64url segments.
+_JWT_KSZTALT_RE = re.compile(r"[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}")
+
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+_ZNACZNIK_CZASU_ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}|$)")
+_HEX_RE = re.compile(r"[A-Fa-f0-9]+")
+
+
 def _looks_like_credential_by_shape(value: str) -> bool:
-    """Return whether ``value`` has credential shape, ignoring its key name.
+    """Return whether ``value`` looks like a credential, ignoring its key name.
 
     Used only on strict security boundaries (``strict_fields=True``) where a
-    secret must never be returned even under a key name nobody enumerated.
-    Deliberately NARROWER than :func:`_looks_like_opaque_credential`: it
-    requires a single whitespace-free opaque run, so ordinary prose values
-    (``"description": "Backup of the prod database"``) and short technical
-    scalars (``"model": "opus"``, ``"port": "8642"``) pass through unchanged
-    and the file stays readable.
+    secret must never be returned even under a key name nobody enumerated and
+    in a file syntax nobody enumerated.
+
+    The gate is SHANNON ENTROPY, not a character-class rule. Round 5 review
+    proved a class-based rule unusable here: it masked git SHAs, UUIDs, URLs,
+    ISO timestamps and model names, because "mixed case plus digits" describes
+    ordinary technical values just as well as secrets. Randomly generated
+    credentials, however, sit near the top of the per-character entropy range
+    while human-structured values (paths, hostnames, dates, slugs, hex digests)
+    do not — so entropy separates the two classes where character classes
+    cannot.
+
+    Structural exclusions come first, for the shapes whose entropy is high
+    enough to be ambiguous but whose format is unmistakable.
     """
     if value == "***" or value.startswith("«redacted"):
         return False
     if any(c.isspace() for c in value):
         return False
-    # Long hex blobs: digests, raw keys, hashed credentials.
-    if len(value) >= 16 and re.fullmatch(r"[A-Fa-f0-9]+", value):
+    if len(value) < _MIN_DLUGOSC_KANDYDATA:
+        return False
+
+    # Vendor-prefixed credentials and JWTs are certain regardless of entropy.
+    if _PREFIKS_DOSTAWCY_RE.match(value) or _JWT_KSZTALT_RE.fullmatch(value):
         return True
-    # Opaque high-entropy run in the character class real credentials use.
-    if len(value) >= 20 and re.fullmatch(r"[A-Za-z0-9_./+=:~-]+", value):
-        classes = sum(
-            bool(re.search(pattern, value))
-            for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]")
-        )
-        # A single-class run of that length is a path, hostname, or an id-like
-        # slug far more often than a secret; require mixed case/digits.
-        return classes >= 2
-    return False
+
+    # --- structural exclusions: high entropy, unmistakable non-secret format
+    if "://" in value:                                   # URL
+        return False
+    if _UUID_RE.fullmatch(value):                        # UUID / GUID
+        return False
+    if _ZNACZNIK_CZASU_ISO_RE.match(value):              # ISO-8601 timestamp
+        return False
+    # Pure hex needs its own rule: its alphabet caps Shannon entropy at 4.0
+    # bits/char, so no hex value can ever clear _PROG_ENTROPII_SEKRETU. Without
+    # this branch a hex-encoded secret would pass on entropy alone. Digest
+    # lengths stay readable (git SHAs and checksums are everywhere in this
+    # codebase and masking them made the file-read tool useless — round 5
+    # finding); any OTHER hex run of candidate length is treated as key
+    # material. Residual risk: a hex credential that happens to be exactly
+    # 32/40/64/128 chars long is not masked here. Accepted because the denylist
+    # in voice_readonly_policy already makes secret-bearing files unreachable on
+    # this boundary — this sweep is the second layer, not the only one.
+    if _HEX_RE.fullmatch(value):
+        return len(value) not in (32, 40, 64, 128)
+    if value.count("/") >= 2:                            # filesystem path
+        return False
+    # Dotted hostname / dotted identifier (api.example.com, com.apple.foo).
+    if value.count(".") >= 2 and not _JWT_KSZTALT_RE.fullmatch(value):
+        return False
+
+    return _entropia_shannona(value) >= _PROG_ENTROPII_SEKRETU
+
+
+def _entropia_shannona(value: str) -> float:
+    """Return Shannon entropy of ``value`` in bits per character."""
+    if not value:
+        return 0.0
+    licznik = Counter(value)
+    dlugosc = len(value)
+    return -sum(
+        (n / dlugosc) * math.log2(n / dlugosc) for n in licznik.values()
+    )
+
+
+# Candidate runs for the strict-boundary sweep: maximal spans of characters
+# that can appear INSIDE a credential. Structural delimiters of every config
+# syntax (quotes, whitespace, = : , ; [ ] { } < > ( ) |) terminate a run, so
+# the same expression finds the value in JSON, YAML, TOML, ENV, XML, CSV and a
+# bare log line without knowing which one it is looking at.
+_KANDYDAT_TOKENU_RE = re.compile(r"[A-Za-z0-9_.\-+/~]{%d,}" % _MIN_DLUGOSC_KANDYDATA)
+
+
+def _ZAMASKUJ_TOKENY_POZA_SKLADNIA(text: str) -> str:
+    """Mask every credential-shaped run in ``text``, ignoring file syntax.
+
+    Strict boundary only (the voice-readonly file-read path). See the call site
+    for why this is syntax-agnostic rather than one pass per config format.
+    """
+    def _zamien(m: "re.Match[str]") -> str:
+        wartosc = m.group(0)
+        # ``os.getenv('X')``-style code snippets are not leaked values; the
+        # delimiters already split those, but a bare dotted call can survive.
+        if _ENV_LOOKUP_VALUE_RE.match(wartosc):
+            return wartosc
+        if not _looks_like_credential_by_shape(wartosc):
+            return wartosc
+        return _mask_token_nonreusable(wartosc)
+
+    return _KANDYDAT_TOKENU_RE.sub(_zamien, text)
 
 # JSON/Python-dict field patterns: "apiKey": "value", 'token': 'value', etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|passwd|access_token|refresh_token|auth_token|id_token|bearer|secret_value|raw_secret|secret_input|key_material|client_secret|client_id|private_key|private_key_id|session_key|signing_secret|webhook_secret|app_secret|consumer_secret|encryption_key)"
@@ -410,28 +509,14 @@ _JSON_FIELD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Key-name-AGNOSTIC quoted field: ANY quoted key with a quoted value. Used ONLY
-# on strict security boundaries (``strict_fields=True``, i.e. the voice-readonly
-# file-read path), where the gate must be the VALUE's shape, not the key's name.
-#
-# Why this exists: _JSON_KEY_NAMES above is an enumeration, and every review
-# round found another real-world credential key missing from it (``refresh_token``
-# in round 1, ``client_secret`` in round 2, ``session_token`` and arbitrary
-# vendor-specific names in round 4). An enumeration can only ever be patched one
-# name at a time, so on a boundary that must never return a secret we invert the
-# test: any field whose value LOOKS like an opaque credential gets masked,
-# whatever the key is called. Ordinary profiles keep the name-anchored pattern,
-# so normal logs/transcripts are unaffected by the broader rule.
-_ANY_JSON_FIELD_RE = re.compile(
-    r'((?P<key_quote>["\'])[A-Za-z0-9_.\-]{1,64}(?P=key_quote))\s*:\s*'
-    r'(?P<value_quote>["\'])([^"\']+)(?P=value_quote)',
-)
-
-# Key-name-agnostic unquoted YAML/colon assignment, same rationale as above.
-_ANY_YAML_ASSIGN_RE = re.compile(
-    r"(^[ \t]*+[A-Za-z0-9_.\-]{1,64})(:[ \t]*+)(?!['\"])([^\s&]++)",
-    re.MULTILINE,
-)
+# The round-4 attempt added key-name-AGNOSTIC syntax patterns here
+# (_ANY_JSON_FIELD_RE / _ANY_YAML_ASSIGN_RE). Round 5 review proved that
+# enumerating SYNTAX is the same unclosable mistake as enumerating key names:
+# TOML ``k = "v"``, ENV ``K=v``, YAML list items, JSON arrays, XML text nodes
+# and keys longer than 64 chars or containing a space were all still leaking,
+# and one ``://`` anywhere in the file disabled the YAML pass entirely. They
+# were removed in favour of the syntax-agnostic _ZAMASKUJ_TOKENY_POZA_SKLADNIA
+# sweep, which runs before any structural pattern on the strict boundary.
 
 # Authorization headers — any scheme (Bearer, Basic, Token, Digest, …) plus the
 # bare-credential form, and Proxy-Authorization. The credential token is masked
@@ -948,6 +1033,21 @@ def redact_sensitive_text(
     if strict_fields:
         code_file = False
 
+    # ---- STRICT BOUNDARY: syntax-agnostic token sweep --------------------
+    # Rounds 1-4 patched this boundary one KEY NAME at a time (_JSON_KEY_NAMES);
+    # round 5 proved that replacing that with per-SYNTAX passes (quoted JSON
+    # field, unquoted YAML assignment) is the same mistake one level up — TOML
+    # ``k = "v"``, ENV ``K=v``, YAML list items, JSON arrays, XML text nodes and
+    # bare values in CSV all leaked, and a single ``://`` anywhere in the file
+    # disabled the whole YAML pass.
+    #
+    # So on this boundary we do not parse structure at all: split the text into
+    # whitespace/delimiter-separated runs and mask every run that looks like a
+    # credential on its own. There is no key name and no file syntax left to
+    # enumerate, which is what makes this closed rather than one-more-patch.
+    if strict_fields:
+        text = _ZAMASKUJ_TOKENY_POZA_SKLADNIA(text)
+
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
@@ -1033,21 +1133,6 @@ def redact_sensitive_text(
                 return f"{key}: {quote}{mask(value)}{quote}"
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
-            # Strict boundary: repeat the pass WITHOUT the key-name enumeration.
-            # Three review rounds each found another credential key missing from
-            # _JSON_KEY_NAMES, so here the gate is the value's shape only.
-            if strict_fields:
-                def _redact_json_any(m):
-                    value = m.group(4)
-                    if _ENV_LOOKUP_VALUE_RE.match(value):
-                        return m.group(0)
-                    if not _looks_like_credential_by_shape(value):
-                        return m.group(0)
-                    key = m.group(1)
-                    quote = m.group("value_quote")
-                    return f"{key}: {quote}{_mask_token_nonreusable(value)}{quote}"
-                text = _ANY_JSON_FIELD_RE.sub(_redact_json_any, text)
-
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
         # quotes). Skip URLs — web-URL query params pass through by design.
@@ -1072,18 +1157,6 @@ def redact_sensitive_text(
                 )
                 return f"{key}{sep}{mask(value)}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
-
-            # Strict boundary: key-name-agnostic unquoted pass (see the JSON
-            # counterpart above for the rationale).
-            if strict_fields:
-                def _redact_yaml_any(m):
-                    value = m.group(3)
-                    if _ENV_LOOKUP_VALUE_RE.match(value):
-                        return m.group(0)
-                    if not _looks_like_credential_by_shape(value):
-                        return m.group(0)
-                    return f"{m.group(1)}{m.group(2)}{_mask_token_nonreusable(value)}"
-                text = _ANY_YAML_ASSIGN_RE.sub(_redact_yaml_any, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
