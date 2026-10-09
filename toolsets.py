@@ -204,6 +204,31 @@ TOOLSETS = {
         "includes": []
     },
     
+    # local-patches (Tomek 2026-10-09, karta ai-infrastructure t_8c01c16f):
+    # techniczna granica dla zlecen glosowych BEZ potwierdzenia wlasciciela.
+    # Do tej pory "tylko odczyt" bylo INSTRUKCJA TEKSTOWA w tresci karty, wiec
+    # parafraza ("niech usluga przestanie dzialac") omijala regexp RYZYKOWNE
+    # i trafiala do workera z pelnym shellem. Tu nie ma terminal, write_file,
+    # patch, execute_code, cronjob, memory ani skill_manage — worker fizycznie
+    # nie ma czym zmienic stanu, nawet jesli tresc zlecenia go o to prosi.
+    # Narzedzia cyklu zycia kanbana (kanban_complete/_block/...) dokladane sa
+    # osobno przez model_tools, gdy ustawione jest HERMES_KANBAN_TASK.
+    # UWAGA: nie dodawaj tu nic, co zapisuje. Regresja pilnuje tej listy —
+    # test_voice_delegacja.py sprawdza, ze zbior nie zawiera narzedzi zapisu.
+    "voice-readonly": {
+        "description": (
+            "Read-only surface for unconfirmed voice-delegated tasks: read "
+            "files, search the filesystem, research the web. No terminal, no "
+            "writes, no code execution, no cron, no memory/skill mutation."
+        ),
+        "tools": [
+            "read_file", "search_files",
+            "web_search", "web_extract",
+            "todo_list",
+        ],
+        "includes": []
+    },
+
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
         "tools": ["text_to_speech"],
