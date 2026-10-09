@@ -1592,6 +1592,12 @@ def init_agent(
         agent._fallback_chain = [fallback_model]
     else:
         agent._fallback_chain = []
+    # Lokalny patch 2026-10-09: worker Kanbana zostaje na silniku wybranym przez
+    # work-router. Fallback (np. Codex 429 -> Claude) omijal rezerwy kont i po
+    # cichu przenosil prace na wyczerpany Claude Max. Przy wyczerpaniu silnika
+    # worker konczy run (handoff/kontynuacja), a router wybiera silnik od nowa.
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)
