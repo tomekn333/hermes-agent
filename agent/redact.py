@@ -834,6 +834,7 @@ def redact_sensitive_text(
     force: bool = False,
     code_file: bool = False,
     file_read: bool = False,
+    strict_fields: bool = False,
     redact_url_credentials: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
@@ -886,6 +887,12 @@ def redact_sensitive_text(
     # paths either (it's config/data, not log lines).
     if file_read:
         code_file = True
+    # Security boundaries (e.g. the voice-readonly profile) need the
+    # ENV-assignment and JSON-field patterns even on file content: without them
+    # a `"refresh_token": "<211 chars>"` in a backup of auth.json survives
+    # redaction verbatim, because it carries no known vendor prefix.
+    if strict_fields:
+        code_file = False
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):

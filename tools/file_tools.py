@@ -621,6 +621,26 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
     return read_path_denial(str(resolved))
 
 
+def _redact_file_content(text: str) -> str:
+    """Redact file content returned to the agent.
+
+    ``force=True`` because this is a security boundary, not a logging
+    preference: ``security.redact_secrets: false`` must not expose credentials
+    to a restricted profile.  ``strict_fields`` keeps the ENV/JSON-field
+    patterns alive for that profile, which is what catches prefix-less secrets
+    such as ``"refresh_token": "…"`` in backups of ``auth.json``.
+    """
+    try:
+        from agent.voice_readonly_policy import is_voice_readonly_profile
+
+        strict = is_voice_readonly_profile()
+    except Exception:
+        strict = True
+    return redact_sensitive_text(
+        text, file_read=True, force=True, strict_fields=strict
+    )
+
+
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
     """Remove credential/cache/env paths from a SearchResult in-place."""
     omitted = 0
@@ -1794,7 +1814,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                             "retrievable via offset."
                         )
                 if result_dict["content"]:
-                    result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
+                    result_dict["content"] = _redact_file_content(result_dict["content"])
                 return json.dumps(result_dict, ensure_ascii=False)
 
         # ── Binary file guard ─────────────────────────────────────────
@@ -1953,7 +1973,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:
-            result.content = redact_sensitive_text(result.content, file_read=True)
+            result.content = _redact_file_content(result.content)
             result_dict["content"] = result.content
 
         # Large-file hint: if the file is big and the caller didn't ask
@@ -2676,14 +2696,21 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if hasattr(result, 'matches'):
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
-                    m.content = redact_sensitive_text(m.content, file_read=True)
+                    m.content = _redact_file_content(m.content)
         result_dict = result.to_dict(densify=True)
 
         if omitted:
-            result_dict["_omitted"] = (
-                f"{omitted} result(s) omitted because they target credential, "
-                "token, cache, or secret-bearing environment files."
-            )
+            # The count itself is a per-query oracle on the content of files the
+            # caller may not read: a restricted caller can binary-search a
+            # secret by pattern and read the counter. For the voice-readonly
+            # profile the response must be indistinguishable from "no matches".
+            from agent.voice_readonly_policy import suppress_omitted_counts
+
+            if not suppress_omitted_counts():
+                result_dict["_omitted"] = (
+                    f"{omitted} result(s) omitted because they target credential, "
+                    "token, cache, or secret-bearing environment files."
+                )
 
         # Populate negative cache when search root was missing. No early
         # return — same rationale as the read path: error results keep

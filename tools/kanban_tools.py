@@ -212,6 +212,40 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _enforce_restricted_task_scope(tid: str, tool: str) -> Optional[str]:
+    """Scope cross-task writes to the own card for restricted profiles.
+
+    Cross-task commenting is a deliberate handoff channel for ordinary
+    workers, but comments are injected verbatim into the *next* worker's
+    system prompt by ``build_worker_context``.  For the ``voice-readonly``
+    tier — whose whole point is that an unconfirmed voice request cannot
+    reach a privileged executor — that is a text channel into the context of
+    a card run by a full-shell profile, i.e. the same escalation that
+    removing ``kanban_create`` was meant to close.  ``kanban_link`` is scoped
+    for the same reason: it can gate a foreign card (board-level DoS).
+    """
+    try:
+        from agent.voice_readonly_policy import is_voice_readonly_profile
+
+        restricted = is_voice_readonly_profile()
+    except Exception:
+        restricted = True
+    if not restricted:
+        return None
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not env_tid:
+        return tool_error(
+            f"{tool} is unavailable to this restricted profile outside a "
+            "dispatched task"
+        )
+    if tid != env_tid:
+        return tool_error(
+            f"{tool}: this restricted profile may only write to its own task "
+            f"{env_tid}"
+        )
+    return None
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -1204,6 +1238,9 @@ def _handle_comment(args: dict, **kw) -> str:
     body = args.get("body")
     if not body or not str(body).strip():
         return tool_error("body is required")
+    scope_err = _enforce_restricted_task_scope(str(tid), "kanban_comment")
+    if scope_err:
+        return scope_err
     body = redact_sensitive_text(str(body), force=True)
     # Author is intentionally derived from the worker's own runtime
     # identity, NOT from caller-supplied args. Comments are injected
@@ -1772,6 +1809,15 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
+    # A restricted worker may only wire edges touching its own card: an
+    # arbitrary parent→child edge can gate (indefinitely block) a foreign
+    # card, which is a board-level denial of service.
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    own = str(env_tid) if env_tid else ""
+    if str(parent_id) != own and str(child_id) != own:
+        scope_err = _enforce_restricted_task_scope(str(child_id), "kanban_link")
+        if scope_err:
+            return scope_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
