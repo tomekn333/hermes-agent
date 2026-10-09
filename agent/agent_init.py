@@ -2036,6 +2036,13 @@ def init_agent(
     except Exception:
         pass
 
+    # Lokalny patch 2026-10-09: workery Kanbana (i ich subagenci) nie robia
+    # w tle przegladu pamieci/skilli — jedna taka sesja zjadala ~16 mln tokenow
+    # Claude (123 wywolania "update the skill library") na jedna karte.
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        agent._skill_nudge_interval = 0
+        agent._memory_nudge_interval = 0
+
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.
     _agent_section = _agent_cfg.get("agent", {})
